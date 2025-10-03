@@ -1,0 +1,176 @@
+from django.db import models
+from django.utils import timezone
+from django.core.exceptions import ValidationError
+from django.conf import settings
+import uuid
+
+
+class AuditLog(models.Model):
+    """Audit log for tracking subscription changes"""
+    ACTION_CHOICES = (
+        ('created', 'Created'),
+        ('updated', 'Updated'),
+        ('deleted', 'Deleted'),
+        ('activated', 'Activated'),
+        ('deactivated', 'Deactivated'),
+        ('expired', 'Expired'),
+        ('renewed', 'Renewed'),
+        ('canceled', 'Canceled'),
+        ('suspended', 'Suspended'),
+        ('plan_changed', 'Plan Changed'),
+        ('advance_renewed', 'Advance Renewed'),
+        ('auto_renew_toggled', 'Auto-Renew Toggled'),
+        ('proration_credited', 'Proration Credited'),
+    )
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    subscription = models.ForeignKey('Subscription', on_delete=models.CASCADE, related_name='audit_logs')
+    action = models.CharField(max_length=20, choices=ACTION_CHOICES)
+    user = models.CharField(max_length=255, null=True, blank=True)
+    details = models.JSONField(default=dict, blank=True)
+    timestamp = models.DateTimeField(auto_now_add=True)
+    ip_address = models.GenericIPAddressField(null=True, blank=True)
+
+    class Meta:
+        ordering = ['-timestamp']
+
+    def __str__(self):
+        return f"{self.action} - {self.subscription.tenant_id} at {self.timestamp}"
+
+
+class Plan(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    INDUSTRY_CHOICES = (
+        ("Finance", "Finance"),
+        ("Healthcare", "Healthcare"),
+        ("Production", "Production"),
+        ("Education", "Education"),
+        ("Technology", "Technology"),
+        ("Retail", "Retail"),
+        ("Hospitality", "Hospitality"),
+        ("Agriculture", "Agriculture"),
+        ("Transport and Logistics", "Transport and Logistics"),
+        ("Real Estate", "Real Estate"),
+        ("Energy and Utilities", "Energy and Utilities"),
+        ("Media and Entertainment", "Media and Entertainment"),
+        ("Government", "Government"),
+        ("Other", "Other"),
+    )
+
+    name = models.CharField(max_length=100)
+    industry = models.CharField(max_length=100, choices=INDUSTRY_CHOICES, default="Other")
+    max_users = models.IntegerField(default=10)
+    max_branches = models.IntegerField(default=2)
+    price = models.DecimalField(max_digits=10, decimal_places=2)
+    duration_days = models.IntegerField(default=30)
+    is_active = models.BooleanField(default=True)
+    discontinued = models.BooleanField(default=False)
+    requires_compliance = models.BooleanField(default=False)
+    regions = models.JSONField(default=list, blank=True)
+    tier_level = models.IntegerField(default=1)  # For downgrade checks
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = ("name", "industry")
+
+    def clean(self):
+        if self.max_users <= 0:
+            raise ValidationError("Max users must be greater than 0")
+        if self.max_branches <= 0:
+            raise ValidationError("Max branches must be greater than 0")
+        if self.price < 0:
+            raise ValidationError("Price cannot be negative")
+        if self.duration_days <= 0:
+            raise ValidationError("Duration must be greater than 0")
+        if self.tier_level < 1:
+            raise ValidationError("Tier level must be positive")
+
+    def __str__(self):
+        return f"{self.name} ({self.industry})"
+
+
+class Subscription(models.Model):
+    STATUS_CHOICES = (
+        ('active', 'Active'),
+        ('expired', 'Expired'),
+        ('canceled', 'Canceled'),
+        ('suspended', 'Suspended'),
+        ('pending', 'Pending'),
+        ('trial', 'Trial'),
+    )
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    tenant_id = models.UUIDField(unique=True, default=uuid.uuid4)
+    plan = models.ForeignKey(Plan, on_delete=models.CASCADE)
+    scheduled_plan = models.ForeignKey(Plan, on_delete=models.SET_NULL, null=True, blank=True, related_name='scheduled_subscriptions')
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='trial')
+    start_date = models.DateTimeField(default=timezone.now)
+    end_date = models.DateTimeField()
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    suspended_at = models.DateTimeField(null=True, blank=True)
+    canceled_at = models.DateTimeField(null=True, blank=True)
+    auto_renew = models.BooleanField(default=True)
+    trial_end_date = models.DateTimeField(null=True, blank=True)
+    last_payment_date = models.DateTimeField(null=True, blank=True)
+    next_payment_date = models.DateTimeField(null=True, blank=True)
+    payment_retry_count = models.IntegerField(default=0)
+    max_payment_retries = models.IntegerField(default=3)
+    is_first_time_subscription = models.BooleanField(default=True)
+    trial_used = models.BooleanField(default=False)
+
+    def save(self, *args, **kwargs):
+        if not self.end_date:
+            if self.status == 'trial' and not self.trial_end_date:
+                self.trial_end_date = self.start_date + timezone.timedelta(days=7)
+                self.end_date = self.trial_end_date
+            else:
+                self.end_date = self.start_date + timezone.timedelta(days=self.plan.duration_days)
+        
+        if self.end_date < timezone.now() and self.status not in ['canceled', 'suspended']:
+            self.status = 'expired'
+        
+        super().save(*args, **kwargs)
+
+    def is_in_grace_period(self):
+        if self.status == 'expired':
+            grace_end = self.end_date + timezone.timedelta(days=settings.SUBSCRIPTION_GRACE_PERIOD_DAYS)
+            return timezone.now() <= grace_end
+        return False
+
+    def can_be_renewed(self):
+        return self.status in ['active', 'expired'] and self.auto_renew
+
+    def get_remaining_days(self):
+        if self.status != 'active':
+            return 0
+        remaining = self.end_date - timezone.now()
+        return max(0, remaining.days)
+
+    def __str__(self):
+        return f"Subscription for Tenant {self.tenant_id} - {self.plan.name}"
+
+
+class SubscriptionCredit(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    subscription = models.ForeignKey(Subscription, on_delete=models.CASCADE, related_name='credits')
+    amount = models.DecimalField(max_digits=10, decimal_places=2)
+    reason = models.CharField(max_length=100)  # e.g., 'proration', 'refund'
+    created_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField(null=True, blank=True)
+    used = models.BooleanField(default=False)
+
+    def __str__(self):
+        return f"Credit {self.amount} for Subscription {self.subscription.id}"
+
+
+class TrialUsage(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    tenant_id = models.UUIDField(unique=True)
+    user_email = models.EmailField()
+    trial_start_date = models.DateTimeField(default=timezone.now)
+    trial_end_date = models.DateTimeField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"Trial for Tenant {self.tenant_id} - {self.user_email}"
