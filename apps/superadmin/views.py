@@ -8,13 +8,16 @@ from django.db.models.functions import TruncMonth
 from apps.billing.models import Subscription, AuditLog
 from apps.payment.models import Payment, WebhookEvent
 from apps.payment.services import PaymentService
+from apps.billing.serializers import SubscriptionSerializer, AuditLogSerializer
 from .serializers import AnalyticsSerializer, WebhookEventSerializer
 import logging
 from .permissions import IsSuperuser
+from .utils import swagger_helper
 
 class SuperadminPortalViewSet(viewsets.ViewSet):
     permission_classes = [IsAuthenticated, IsSuperuser]
 
+    @swagger_helper(tags=['Superadmin Portal'], model='Analytics')
     @action(detail=False, methods=['get'], url_path='analytics')
     def get_analytics(self, request):
         try:
@@ -87,6 +90,7 @@ class SuperadminPortalViewSet(viewsets.ViewSet):
             logger.error(f"Analytics retrieval failed: {str(e)}")
             return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+    @swagger_helper(tags=['Superadmin Portal'], model='Subscription')
     @action(detail=False, methods=['get'], url_path='subscriptions')
     def list_subscriptions(self, request):
         try:
@@ -102,6 +106,7 @@ class SuperadminPortalViewSet(viewsets.ViewSet):
             logger.error(f"Subscription list retrieval failed: {str(e)}")
             return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+    @swagger_helper(tags=['Superadmin Portal'], model='Subscription Audit Log')
     @action(detail=True, methods=['get'], url_path='subscription-audit-logs')
     def get_subscription_audit_logs(self, request, pk=None):
         try:
@@ -122,6 +127,7 @@ class SuperadminPortalViewSet(viewsets.ViewSet):
             logger.error(f"Audit logs retrieval failed: {str(e)}")
             return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+    @swagger_helper(tags=['Superadmin Portal'], model='Webhook Event')
     @action(detail=True, methods=['post'], url_path='retry-webhook')
     def retry_webhook(self, request, pk=None):
         try:
@@ -134,6 +140,7 @@ class SuperadminPortalViewSet(viewsets.ViewSet):
             logger.error(f"Webhook retry failed for event {pk}: {str(e)}")
             return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+    @swagger_helper(tags=['Superadmin Portal'], model='Webhook Event')
     @action(detail=False, methods=['get'], url_path='webhook-events')
     def list_webhook_events(self, request):
         try:
