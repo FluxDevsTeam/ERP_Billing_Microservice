@@ -15,7 +15,7 @@ from .models import Plan, Subscription, AuditLog
 from apps.payment.models import Payment
 from .serializers import PlanSerializer, SubscriptionSerializer, PaymentSerializer, SubscriptionCreateSerializer, PlanChangeSerializer, AdvanceRenewalSerializer, AutoRenewToggleSerializer
 from .permissions import IsSuperuser, IsCEO, IsCEOorSuperuser, CanViewEditSubscription, PlanReadOnlyForCEO
-from .utils import IdentityServiceClient
+from .utils import IdentityServiceClient, _extract_user_role, swagger_helper
 from .services import SubscriptionService, UsageMonitorService, PaymentRetryService
 from .validators import SubscriptionValidator, UsageValidator, InputValidator
 from .circuit_breaker import CircuitBreakerManager
@@ -67,6 +67,7 @@ class PlanView(viewsets.ModelViewSet):
 
         return Plan.objects.none()
 
+    @swagger_helper("Subscription Management", "create")
     def create(self, request, *args, **kwargs):
         try:
             validator = InputValidator()
@@ -98,6 +99,7 @@ class PlanView(viewsets.ModelViewSet):
             logger.error(f"Plan creation failed: {str(e)}")
             return Response({'error': 'Plan creation failed'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+    @swagger_helper("Access Management", "health_check")
     @action(detail=False, methods=['get'], url_path='health')
     def health_check(self, request):
         try:
@@ -117,6 +119,23 @@ class PlanView(viewsets.ModelViewSet):
                 'error': str(e),
                 'timestamp': timezone.now().isoformat()
             }, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+
+    @swagger_helper("Plan", "list")
+    def list(self, request, *args, **kwargs):
+        return super().list(request, *args, **kwargs)
+
+    @swagger_helper("Plan", "retrieve")
+    def retrieve(self, request, *args, **kwargs):
+        return super().retrieve(request, *args, **kwargs)
+
+    @swagger_helper("Plan", "partial_update")
+    def partial_update(self, request, *args, **kwargs):
+        return super().partial_update(request, *args, **kwargs)
+
+    @swagger_helper("Plan", "destroy")
+    def destroy(self, request, *args, **kwargs):
+        return super().destroy(request, *args, **kwargs)
 
 
 class SubscriptionView(viewsets.ModelViewSet):
@@ -149,6 +168,7 @@ class SubscriptionView(viewsets.ModelViewSet):
             return [IsAuthenticated(), IsSuperuser()]
         return [IsAuthenticated()]
 
+    @swagger_helper("Subscription Management", "create")
     def create(self, request, *args, **kwargs):
         try:
             serializer = SubscriptionCreateSerializer(data=request.data, context={'request': request})
@@ -199,6 +219,7 @@ class SubscriptionView(viewsets.ModelViewSet):
             return Response({'error': 'Failed to retrieve subscriptions'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=True, methods=['post'], url_path='renew')
+    @swagger_helper("Subscriptions", "renew_subscription")
     def renew_subscription(self, request, pk=None):
         try:
             subscription_service = SubscriptionService(request)
@@ -222,6 +243,7 @@ class SubscriptionView(viewsets.ModelViewSet):
             return Response({'error': 'Subscription renewal failed'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=True, methods=['post'], url_path='suspend')
+    @swagger_helper("Subscriptions", "suspend_subscription")
     def suspend_subscription(self, request, pk=None):
         try:
             reason = request.data.get('reason', 'Administrative suspension')
@@ -247,6 +269,7 @@ class SubscriptionView(viewsets.ModelViewSet):
             return Response({'error': 'Subscription suspension failed'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=True, methods=['post'], url_path='change-plan')
+    @swagger_helper("Subscriptions", "change_plan")
     def change_plan(self, request, pk=None):
         try:
             serializer = PlanChangeSerializer(data=request.data, context={'subscription': self.get_object()})
@@ -277,6 +300,7 @@ class SubscriptionView(viewsets.ModelViewSet):
             return Response({'error': 'Plan change failed'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=True, methods=['post'], url_path='advance-renewal')
+    @swagger_helper("Subscriptions", "advance_renewal")
     def advance_renewal(self, request, pk=None):
         try:
             serializer = AdvanceRenewalSerializer(data=request.data)
@@ -306,6 +330,7 @@ class SubscriptionView(viewsets.ModelViewSet):
             return Response({'error': 'Advance renewal failed'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=True, methods=['post'], url_path='toggle-auto-renew')
+    @swagger_helper("Subscriptions", "toggle_auto_renew")
     def toggle_auto_renew(self, request, pk=None):
         try:
             serializer = AutoRenewToggleSerializer(data=request.data)
@@ -333,6 +358,7 @@ class SubscriptionView(viewsets.ModelViewSet):
             return Response({'error': 'Auto-renew toggle failed'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=False, methods=['post'], url_path='check-expired')
+    @swagger_helper("Subscriptions", "check_expired_subscriptions")
     def check_expired_subscriptions(self, request):
         try:
             if not (self.request.user.is_superuser or _extract_user_role(self.request.user) == 'superuser'):
@@ -350,6 +376,7 @@ class SubscriptionView(viewsets.ModelViewSet):
             return Response({'error': 'Expired subscription check failed'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=True, methods=['get'], url_path='audit-logs')
+    @swagger_helper("Subscriptions", "get_audit_logs")
     def get_audit_logs(self, request, pk=None):
         try:
             subscription = self.get_object()
@@ -689,6 +716,7 @@ class AccessCheckView(viewsets.ViewSet):
                 "timestamp": timezone.now().isoformat()
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+    @swagger_helper("Access Management", "health_check")
     @action(detail=False, methods=['get'], url_path='health')
     def health_check(self, request):
         try:

@@ -1,14 +1,8 @@
 from rest_framework.permissions import BasePermission
 import logging
+from apps.billing.utils import _extract_user_role
 
 logger = logging.getLogger('billing')
-
-def _extract_user_role(user):
-    role = getattr(user, 'user_role_lowercase', None)
-    if not role and user.is_authenticated:
-        role = user.groups.first().name.lower() if user.groups.exists() else None
-    logger.debug(f"Extracted user role: {role} for user {user.id}")
-    return role
 
 class IsSuperuser(BasePermission):
     def has_permission(self, request, view):
