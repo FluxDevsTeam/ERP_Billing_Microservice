@@ -17,7 +17,7 @@ from apps.billing.models import Subscription, Plan
 from .permissions import CanInitiatePayment
 from .serializers import PaymentSerializer, InitiateSerializer, PaymentSummaryInputSerializer
 from .payments import initiate_flutterwave_payment, initiate_paystack_payment
-from .utils import generate_confirm_token, initiate_refund
+from .utils import generate_confirm_token, initiate_refund, swagger_helper
 from apps.billing.utils import IdentityServiceClient
 import uuid
 from django.utils import timezone
@@ -25,7 +25,9 @@ from .services import PaymentService
 
 
 class PaymentRefundViewSet(viewsets.ViewSet):
-    permission_classes = [IsAuthenticated] 
+    permission_classes = [IsAuthenticated]
+
+    @swagger_helper(tags=['Payment'], model='Payment Refund')
     def create(self, request, pk=None):
         try:
             payment_service = PaymentService(request)
@@ -47,6 +49,7 @@ class PaymentSummaryViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
     serializer_class = PaymentSummaryInputSerializer
 
+    @swagger_helper(tags=['Payment'], model='Payment Summary')
     def create(self, request):
         try:
             serializer = self.get_serializer(data=request.data)
@@ -144,6 +147,7 @@ class PaymentInitiateViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated, CanInitiatePayment]
     serializer_class = InitiateSerializer
 
+    @swagger_helper(tags=['Payment'], model='Payment Initiate')
     def create(self, request):
         try:
             serializer = self.get_serializer(data=request.data)
@@ -225,6 +229,7 @@ class PaymentInitiateViewSet(viewsets.ModelViewSet):
 class PaymentVerifyViewSet(viewsets.ViewSet):
     permission_classes = [AllowAny]
 
+    @swagger_helper(tags=['Payment'], model='Payment Verify')
     @transaction.atomic
     @action(detail=False, methods=['get'])
     def confirm(self, request):
@@ -342,6 +347,7 @@ class PaymentVerifyViewSet(viewsets.ViewSet):
 class PaymentWebhookViewSet(viewsets.ViewSet):
     permission_classes = [AllowAny]
 
+    @swagger_helper(tags=['Payment'], model='Payment Webhook')
     @transaction.atomic
     @action(detail=False, methods=['post'])
     @csrf_exempt
