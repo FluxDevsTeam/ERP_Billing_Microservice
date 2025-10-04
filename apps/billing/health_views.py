@@ -13,7 +13,7 @@ import logging
 
 from .circuit_breaker import CircuitBreakerManager
 from .models import Plan, Subscription, AuditLog
-from .utils import IdentityServiceClient
+from .utils import IdentityServiceClient, swagger_helper
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +22,7 @@ class SystemHealthView(viewsets.ViewSet):
     """Comprehensive system health check"""
     permission_classes = [AllowAny]
 
+    @swagger_helper("System HeALTH", "List")
     def list(self, request):
         """Overall system health check"""
         try:
@@ -223,6 +224,7 @@ class SystemHealthView(viewsets.ViewSet):
                 'error': str(e)
             }
 
+    @swagger_helper("System HeALTH", "List")
     @action(detail=False, methods=['get'], url_path='detailed')
     def detailed_health(self, request):
         """Detailed health check with more information"""

@@ -39,5 +39,5 @@ urlpatterns = [
 
     # System Health
     path('health/', SystemHealthView.as_view({'get': 'list'}), name='system_health'),
-    path('health/detailed/', SystemHealthView.as_view({'get': 'detailed_health'}), name='detailed_health'),
+    path('detailed-health/', SystemHealthView.as_view({'get': 'detailed_health'}), name='detailed_health'),
 ]

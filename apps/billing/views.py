@@ -67,7 +67,7 @@ class PlanView(viewsets.ModelViewSet):
 
         return Plan.objects.none()
 
-    @swagger_helper("Subscription Management", "create")
+    @swagger_helper("Plan", "create")
     def create(self, request, *args, **kwargs):
         try:
             validator = InputValidator()
@@ -99,7 +99,7 @@ class PlanView(viewsets.ModelViewSet):
             logger.error(f"Plan creation failed: {str(e)}")
             return Response({'error': 'Plan creation failed'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-    @swagger_helper("Access Management", "health_check")
+    @swagger_helper("Plan", "health_check")
     @action(detail=False, methods=['get'], url_path='health')
     def health_check(self, request):
         try:
@@ -132,6 +132,10 @@ class PlanView(viewsets.ModelViewSet):
     @swagger_helper("Plan", "partial_update")
     def partial_update(self, request, *args, **kwargs):
         return super().partial_update(request, *args, **kwargs)
+
+    @swagger_helper("Plan", "update")
+    def update(self, request, *args, **kwargs):
+        return super().update(request, *args, **kwargs)
 
     @swagger_helper("Plan", "destroy")
     def destroy(self, request, *args, **kwargs):
@@ -168,7 +172,7 @@ class SubscriptionView(viewsets.ModelViewSet):
             return [IsAuthenticated(), IsSuperuser()]
         return [IsAuthenticated()]
 
-    @swagger_helper("Subscription Management", "create")
+    @swagger_helper("Subscriptions", "create")
     def create(self, request, *args, **kwargs):
         try:
             serializer = SubscriptionCreateSerializer(data=request.data, context={'request': request})
@@ -197,6 +201,7 @@ class SubscriptionView(viewsets.ModelViewSet):
             logger.error(f"Subscription creation failed: {str(e)}")
             return Response({'error': 'Subscription creation failed'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+    @swagger_helper("Subscriptions", "list")
     def list(self, request, *args, **kwargs):
         try:
             cache_key = f"subscriptions_{request.user.id}_{request.GET.urlencode()}"
@@ -404,11 +409,28 @@ class SubscriptionView(viewsets.ModelViewSet):
             logger.error(f"Audit logs retrieval failed for {pk}: {str(e)}")
             return Response({'error': 'Failed to retrieve audit logs'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+    @swagger_helper("Subscriptions", "retrieve")
+    def retrieve(self, request, *args, **kwargs):
+        return super().retrieve(request, *args, **kwargs)
+
+    @swagger_helper("Subscriptions", "partial_update")
+    def partial_update(self, request, *args, **kwargs):
+        return super().partial_update(request, *args, **kwargs)
+
+    @swagger_helper("Subscriptions", "update")
+    def update(self, request, *args, **kwargs):
+        return super().update(request, *args, **kwargs)
+
+    @swagger_helper("Subscriptions", "destroy")
+    def destroy(self, request, *args, **kwargs):
+        return super().destroy(request, *args, **kwargs)
+
 
 class CustomerPortalViewSet(viewsets.ViewSet):
     permission_classes = [IsAuthenticated, CanViewEditSubscription]
 
     @action(detail=False, methods=['get'], url_path='details')
+    @swagger_helper("Customer Portal", "get_subscription_details")
     def get_subscription_details(self, request):
         try:
             tenant_id = getattr(request.user, 'tenant', None)
@@ -433,6 +455,7 @@ class CustomerPortalViewSet(viewsets.ViewSet):
             return Response({'error': 'Failed to retrieve subscription details'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=False, methods=['post'], url_path='change-plan')
+    @swagger_helper("Customer Portal", "change_plan")
     def change_plan(self, request):
         try:
             tenant_id = getattr(request.user, 'tenant', None)
@@ -473,6 +496,7 @@ class CustomerPortalViewSet(viewsets.ViewSet):
             return Response({'error': 'Plan change failed'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=False, methods=['post'], url_path='advance-renewal')
+    @swagger_helper("Customer Portal", "advance_renewal")
     def advance_renewal(self, request):
         try:
             tenant_id = getattr(request.user, 'tenant', None)
@@ -511,6 +535,7 @@ class CustomerPortalViewSet(viewsets.ViewSet):
             return Response({'error': 'Advance renewal failed'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=False, methods=['post'], url_path='toggle-auto-renew')
+    @swagger_helper("Customer Portal", "toggle_auto_renew")
     def toggle_auto_renew(self, request):
         try:
             tenant_id = getattr(request.user, 'tenant', None)
@@ -550,6 +575,7 @@ class CustomerPortalViewSet(viewsets.ViewSet):
 class AccessCheckView(viewsets.ViewSet):
     permission_classes = [IsAuthenticated]
 
+    @swagger_helper("Access Check", "list")
     def list(self, request):
         try:
             tenant_id = getattr(request.user, 'tenant', None)
@@ -634,6 +660,7 @@ class AccessCheckView(viewsets.ViewSet):
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=False, methods=['get'], url_path='limits')
+    @swagger_helper("Access Check", "check_limits")
     def check_limits(self, request):
         try:
             tenant_id = getattr(request.user, 'tenant', None)
@@ -716,7 +743,7 @@ class AccessCheckView(viewsets.ViewSet):
                 "timestamp": timezone.now().isoformat()
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-    @swagger_helper("Access Management", "health_check")
+    @swagger_helper("Access Check", "health_check")
     @action(detail=False, methods=['get'], url_path='health')
     def health_check(self, request):
         try:
@@ -757,8 +784,9 @@ class AccessCheckView(viewsets.ViewSet):
                 'timestamp': timezone.now().isoformat()
             }, status=status.HTTP_503_SERVICE_UNAVAILABLE)
 
-        @action(detail=False, methods=['post'], url_path='validate-usage')
-        def validate_usage(self, request):
+    @action(detail=False, methods=['post'], url_path='validate-usage')
+    @swagger_helper("Access Check", "validate_usage")
+    def validate_usage(self, request):
             try:
                 tenant_id = getattr(request.user, 'tenant', None)
                 if not tenant_id:
