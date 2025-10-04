@@ -22,7 +22,7 @@ class SystemHealthView(viewsets.ViewSet):
     """Comprehensive system health check"""
     permission_classes = [AllowAny]
 
-    @swagger_helper("System HeALTH", "List")
+    @swagger_helper("System Health", "List")
     def list(self, request):
         """Overall system health check"""
         try:
@@ -224,7 +224,7 @@ class SystemHealthView(viewsets.ViewSet):
                 'error': str(e)
             }
 
-    @swagger_helper("System HeALTH", "List")
+    @swagger_helper("System Health", "List")
     @action(detail=False, methods=['get'], url_path='detailed')
     def detailed_health(self, request):
         """Detailed health check with more information"""
