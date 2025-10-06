@@ -9,7 +9,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent.parent
 
 SECRET_KEY = os.getenv("SECRET_KEY")
 
-DEBUG = os.getenv("DEBUG", "False") == "True"
+DEBUG = os.getenv("DEBUG")
 
 INSTALLED_APPS = [
     'django.contrib.auth',
@@ -129,6 +129,7 @@ CORS_ALLOW_METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']
 FRONTEND_PATH = os.getenv("FRONTEND_PATH", "http://localhost:3000")
 IDENTITY_MICROSERVICE_URL = os.getenv("IDENTITY_MICROSERVICE_URL", "http://localhost:8000")
 BILLING_MICROSERVICE_URL = os.getenv("BILLING_MICROSERVICE_URL", "http://localhost:8080")
+FINANCE_MICROSERVICE_URL = os.getenv("FINANCE_MICROSERVICE_URL")
 
 PAYMENT_CURRENCY = os.getenv("PAYMENT_CURRENCY", "NGN")
 

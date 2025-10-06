@@ -14,6 +14,7 @@ import logging
 from .permissions import IsSuperuser
 from .utils import swagger_helper
 
+
 class SuperadminPortalViewSet(viewsets.ViewSet):
     permission_classes = [IsAuthenticated, IsSuperuser]
 
