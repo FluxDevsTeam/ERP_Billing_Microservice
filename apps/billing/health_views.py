@@ -22,8 +22,7 @@ class SystemHealthView(viewsets.ViewSet):
     """Comprehensive system health check"""
     permission_classes = [AllowAny]
 
-    @swagger_helper("System Health"
-                    "", "List")
+    @swagger_helper("System Health", "List")
     def list(self, request):
         """Overall system health check"""
         try:
