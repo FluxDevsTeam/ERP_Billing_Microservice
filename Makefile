@@ -46,7 +46,7 @@ install:
 
 # Run local server
 run:
-	$(DJANGO_MANAGE) runserver
+	$(DJANGO_MANAGE) runserver 8080
 
 start:
 	$(DJANGO_MANAGE) startapp
