@@ -5,6 +5,14 @@ from django.conf import settings
 import uuid
 
 
+# Tier choices for consistency across models (e.g., used in Plan, Permission.subscription_tiers, Role.subscription_tiers)
+TIER_CHOICES = (
+    ('tier1', 'Tier 1 - Basic'),
+    ('tier2', 'Tier 2 - Pro'),
+    ('tier3', 'Tier 3 - Enterprise'),
+)
+
+
 class AuditLog(models.Model):
     """Audit log for tracking subscription changes"""
     ACTION_CHOICES = (
@@ -67,7 +75,11 @@ class Plan(models.Model):
     discontinued = models.BooleanField(default=False)
     requires_compliance = models.BooleanField(default=False)
     regions = models.JSONField(default=list, blank=True)
-    tier_level = models.IntegerField(default=1)  # For downgrade checks
+    tier_level = models.CharField(
+        max_length=10,
+        choices=TIER_CHOICES,
+        default='tier1'
+    )  # For downgrade checks; now a consistent choice field
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -83,8 +95,6 @@ class Plan(models.Model):
             raise ValidationError("Price cannot be negative")
         if self.duration_days <= 0:
             raise ValidationError("Duration must be greater than 0")
-        if self.tier_level < 1:
-            raise ValidationError("Tier level must be positive")
 
     def __str__(self):
         return f"{self.name} ({self.industry})"

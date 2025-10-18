@@ -10,7 +10,7 @@ schema_view = get_schema_view(
             An API Template For ERP Billing App.
 
             **Servers:**
-            - Local: [http://localhost:8000](http://localhost:8000)
+            - Local: [http://localhost:8080](http://localhost:8000)
             - Production: [https://domain.com/](https://domain.com/)
             """,
         contact=openapi.Contact(email="suskidee@gmail.com"),
