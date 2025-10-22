@@ -5,11 +5,11 @@ from django.conf import settings
 import uuid
 
 
-# Tier choices for consistency across models (e.g., used in Plan, Permission.subscription_tiers, Role.subscription_tiers)
 TIER_CHOICES = (
-    ('tier1', 'Tier 1 - Basic'),
-    ('tier2', 'Tier 2 - Pro'),
-    ('tier3', 'Tier 3 - Enterprise'),
+    ('tier1', 'Tier 1 - Small Business (1-10 users, 1 branch)'),
+    ('tier2', 'Tier 2 - Medium Business (11-50 users, 2-5 branches)'),
+    ('tier3', 'Tier 3 - Large Enterprise (51-200 users, 6-20 branches)'),
+    ('tier4', 'Tier 4 - Global Corporation (201+ users, 21+ branches)'),
 )
 
 
@@ -66,6 +66,7 @@ class Plan(models.Model):
     )
 
     name = models.CharField(max_length=100)
+    description = models.TextField(blank=True, help_text="Detailed description of the plan and its features")
     industry = models.CharField(max_length=100, choices=INDUSTRY_CHOICES, default="Other")
     max_users = models.IntegerField(default=10)
     max_branches = models.IntegerField(default=2)
@@ -73,13 +74,7 @@ class Plan(models.Model):
     duration_days = models.IntegerField(default=30)
     is_active = models.BooleanField(default=True)
     discontinued = models.BooleanField(default=False)
-    requires_compliance = models.BooleanField(default=False)
-    regions = models.JSONField(default=list, blank=True)
-    tier_level = models.CharField(
-        max_length=10,
-        choices=TIER_CHOICES,
-        default='tier1'
-    )  # For downgrade checks; now a consistent choice field
+    tier_level = models.CharField(max_length=10, choices=TIER_CHOICES, default='tier1')
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

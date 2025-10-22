@@ -1,4 +1,5 @@
 from rest_framework import serializers
+from django.utils import timezone
 from .models import Plan, Subscription, AuditLog, TrialUsage
 from apps.payment.models import Payment
 import logging
@@ -10,9 +11,8 @@ class PlanSerializer(serializers.ModelSerializer):
     class Meta:
         model = Plan
         fields = [
-            'id', 'name', 'industry', 'max_users', 'max_branches', 'price',
-            'duration_days', 'is_active', 'discontinued', 'requires_compliance',
-            'regions', 'tier_level', 'created_at', 'updated_at'
+            'id', 'name', 'description', 'industry', 'max_users', 'max_branches', 'price',
+            'duration_days', 'is_active', 'discontinued', 'tier_level', 'created_at', 'updated_at'
         ]
         read_only_fields = ['created_at', 'updated_at']
 

@@ -24,6 +24,7 @@ urlpatterns = [
     path('subscriptions/<uuid:pk>/toggle-auto-renew/', SubscriptionView.as_view({'post': 'toggle_auto_renew'}), name='subscription_toggle_auto_renew'),
     path('subscriptions/<uuid:pk>/audit-logs/', SubscriptionView.as_view({'get': 'get_audit_logs'}), name='subscription_audit_logs'),
     path('subscriptions/check-expired/', SubscriptionView.as_view({'post': 'check_expired_subscriptions'}), name='subscription_check_expired'),
+    path('subscriptions/activate-trial/', SubscriptionView.as_view({'post': 'activate_trial'}), name='subscription_activate_trial'),
 
     # CustomerPortalViewSet
     path('customer-portal/details/', CustomerPortalViewSet.as_view({'get': 'get_subscription_details'}), name='customer_portal_details'),
