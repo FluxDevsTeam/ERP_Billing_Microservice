@@ -2,25 +2,20 @@ import requests
 import logging
 from django.conf import settings
 from typing import Dict, Any, Optional
+from drf_yasg.utils import swagger_auto_schema
+from .pagination import PAGINATION_PARAMS
 
 logger = logging.getLogger('billing')
-
-def _extract_user_role(user):
-    role = getattr(user, 'user_role_lowercase', None)
-    if not role and user.is_authenticated:
-        role = user.groups.first().name.lower() if user.groups.exists() else None
-    logger.debug(f"Extracted user role: {role} for user {user.id}")
-    return role
 
 class IdentityServiceClient:
     def __init__(self, request=None):
         self.request = request
-        self.base_url = settings.IDENTITY_SERVICE_URL
+        self.base_url = settings.IDENTITY_MICROSERVICE_URL
 
     def get_tenant(self, tenant_id: str) -> Optional[Dict[str, Any]]:
         try:
             headers = self._get_headers()
-            response = requests.get(f"{self.base_url}/tenants/{tenant_id}", headers=headers, timeout=5)
+            response = requests.get(f"{self.base_url}/api/v1/tenant/{tenant_id}", headers=headers, timeout=5)
             response.raise_for_status()
             logger.info(f"Tenant {tenant_id} retrieved from identity service")
             return response.json()
@@ -31,10 +26,14 @@ class IdentityServiceClient:
     def get_users(self, tenant_id: str) -> list:
         try:
             headers = self._get_headers()
-            response = requests.get(f"{self.base_url}/tenants/{tenant_id}/users", headers=headers, timeout=5)
+            params = {'tenant_id': tenant_id} if tenant_id else None
+            # identity service returns paginated results: {'count':.., 'results': [...]}
+            response = requests.get(f"{self.base_url}/api/v1/user/management/", headers=headers, params=params, timeout=5)
             response.raise_for_status()
-            logger.info(f"Users for tenant {tenant_id} retrieved from identity service")
-            return response.json()
+            data = response.json()
+            results = data.get('results') if isinstance(data, dict) else None
+            logger.info(f"Users for tenant {tenant_id} retrieved from identity service; count={data.get('count') if isinstance(data, dict) else 'unknown'}")
+            return results if results is not None else (data if data is not None else [])
         except Exception as e:
             logger.error(f"Failed to get users for tenant {tenant_id}: {str(e)}")
             raise
@@ -42,23 +41,77 @@ class IdentityServiceClient:
     def get_branches(self, tenant_id: str) -> list:
         try:
             headers = self._get_headers()
-            response = requests.get(f"{self.base_url}/tenants/{tenant_id}/branches", headers=headers, timeout=5)
+            # some identity services expose branches at /api/v1/branch/ and support tenant filter
+            params = {'tenant_id': tenant_id} if tenant_id else None
+            # try branch endpoint first
+            branch_url = f"{self.base_url}/api/v1/branch/"
+            response = requests.get(branch_url, headers=headers, params=params, timeout=5)
             response.raise_for_status()
-            logger.info(f"Branches for tenant {tenant_id} retrieved from identity service")
-            return response.json()
+            data = response.json()
+            results = data.get('results') if isinstance(data, dict) else None
+            logger.info(f"Branches for tenant {tenant_id} retrieved from identity service; count={data.get('count') if isinstance(data, dict) else 'unknown'}")
+            return results if results is not None else (data if data is not None else [])
         except Exception as e:
             logger.error(f"Failed to get branches for tenant {tenant_id}: {str(e)}")
             raise
 
     def _get_headers(self) -> Dict[str, str]:
         headers = {'Content-Type': 'application/json'}
-        if self.request and hasattr(self.request, 'user') and self.request.user.is_authenticated:
-            headers['Authorization'] = f"Bearer {self.request.user.auth_token}"
+        if self.request:
+            # First try to get token from request headers
+            auth_header = self.request.headers.get('Authorization')
+            if auth_header:
+                headers['Authorization'] = auth_header
+                print(f"Using Authorization header from request: {auth_header[:15]}...")  # Debug print, only shows first 15 chars
+            # Fallback to user object if no header found
+            elif hasattr(self.request, 'user') and self.request.user.is_authenticated:
+                access_token = getattr(self.request.user, 'access_token', None)
+                if not access_token:
+                    access_token = getattr(self.request.user, 'auth_token', None)
+                
+                if access_token:
+                    headers['Authorization'] = f"JWT {access_token}"
+                    print(f"Using Authorization header from user: JWT {access_token[:10]}...")
+                else:
+                    print("No access token found in request headers or user object")
         return headers
 
 
-from drf_yasg.utils import swagger_auto_schema
-from .pagination import PAGINATION_PARAMS
+
+def get_request_role(request) -> Optional[str]:
+    """Normalize and return a role string from the request or user object.
+
+    Checks several common locations that identity systems use for storing role:
+    - request.role
+    - request.user.role
+    - request.user.user_role
+    - request.user.user_role_lowercase
+
+    Returns the role as lowercase string or None if not found.
+    """
+    if not request:
+        return None
+    # direct request.role
+    role = getattr(request, 'role', None)
+    if role:
+        return role.lower()
+    # try user attributes
+    user = getattr(request, 'user', None)
+    if not user:
+        return None
+    for attr in ('role', 'user_role', 'user_role_lowercase'):
+        if hasattr(user, attr):
+            val = getattr(user, attr)
+            if val:
+                return val.lower() if isinstance(val, str) else None
+    # sometimes role may be set under a nested dict like user.role['name'] etc. try best-effort
+    try:
+        val = getattr(user, 'role', None)
+        if isinstance(val, dict) and 'name' in val:
+            return str(val['name']).lower()
+    except Exception:
+        pass
+    return None
 
 
 def swagger_helper(tags, model):

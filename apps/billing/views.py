@@ -16,7 +16,7 @@ from apps.payment.models import Payment
 from .serializers import PlanSerializer, SubscriptionSerializer, PaymentSerializer, SubscriptionCreateSerializer, PlanChangeSerializer, AdvanceRenewalSerializer, AutoRenewToggleSerializer
 from .utils import send_email_via_service
 from .permissions import IsSuperuser, IsCEO, IsCEOorSuperuser, CanViewEditSubscription, PlanReadOnlyForCEO
-from .utils import IdentityServiceClient, _extract_user_role, swagger_helper
+from .utils import IdentityServiceClient, swagger_helper
 from .services import SubscriptionService, UsageMonitorService, PaymentRetryService
 from .validators import SubscriptionValidator, UsageValidator, InputValidator
 from .circuit_breaker import CircuitBreakerManager
@@ -25,46 +25,67 @@ from .circuit_breaker import CircuitBreakerManager
 
 class PlanView(viewsets.ModelViewSet):
     serializer_class = PlanSerializer
-    permission_classes = [IsAuthenticated, PlanReadOnlyForCEO]
+    permission_classes = [IsAuthenticated]
     filter_backends = [DjangoFilterBackend, SearchFilter]
     search_fields = ['name']
     filterset_fields = ['id', 'name', 'price', 'industry', 'is_active', 'discontinued']
 
+    def get_permissions(self):
+        if self.action in ['list', 'retrieve']:
+            # Debug prints to inspect incoming user and role
+            try:
+                print("PlanView.get_permissions - user:", getattr(self.request, 'user', None))
+                print("PlanView.get_permissions - possible role fields:", getattr(self.request, 'role', None), getattr(self.request.user, 'role', None), getattr(self.request.user, 'user_role', None), getattr(self.request.user, 'user_role_lowercase', None))
+            except Exception:
+                pass
+            # Allow CEOs and superusers to view plans
+            return [IsAuthenticated(), IsCEOorSuperuser()]
+        # All other actions require superuser permissions
+        return [IsAuthenticated(), IsSuperuser()]
+
     def get_queryset(self):
         user = self.request.user
         base_qs = Plan.objects.all()
-        user_role = _extract_user_role(user)
+        role = getattr(user, 'role', None)
 
-        if user.is_superuser or user_role == 'superuser':
+        # Debug prints
+        print(f"PlanView.get_queryset - User: {user}, Role: {role}")
+
+        # Superuser sees all plans
+        if user.is_superuser or (role and role.lower() == 'superuser'):
+            print("User is superuser - showing all plans")
             return base_qs
 
-        if user_role == 'ceo':
+        # CEO role handling
+        if role and role.lower() == 'ceo':
+            print("User is CEO")
             tenant_id = getattr(user, 'tenant', None)
+            
             if not tenant_id:
+                print("No tenant ID found for CEO")
                 return Plan.objects.none()
-
-            circuit_breaker_manager = CircuitBreakerManager()
-            identity_breaker = circuit_breaker_manager.get_breaker('identity_service')
-
-            if not identity_breaker.can_execute():
-                cache_key = f"tenant_industry_{tenant_id}"
-                industry = cache.get(cache_key, 'Other')
-                return base_qs.filter(industry=industry, is_active=True)
 
             try:
                 client = IdentityServiceClient(request=self.request)
                 tenant = client.get_tenant(tenant_id=tenant_id)
-                industry = tenant.get('industry', 'Other') if tenant and isinstance(tenant, dict) else 'Other'
-                cache_key = f"tenant_industry_{tenant_id}"
-                cache.set(cache_key, industry, 300)
-                return base_qs.filter(industry=industry, is_active=True)
+                industry = tenant.get('industry') if tenant and isinstance(tenant, dict) else None
+                
+                print(f"CEO tenant industry: {industry}")
+                
+                if not industry:
+                    print("No industry found for CEO's tenant")
+                    return Plan.objects.none()
+                
+                # Only return active plans for the CEO's industry
+                result = base_qs.filter(is_active=True, industry__iexact=industry)
+                print(f"Found {result.count()} plans for industry: {industry}")
+                return result
+                
             except Exception as e:
+                print(f"Error getting tenant data: {str(e)}")
+                return Plan.objects.none()
 
-                identity_breaker.record_failure()
-                cache_key = f"tenant_industry_{tenant_id}"
-                industry = cache.get(cache_key, 'Other')
-                return base_qs.filter(industry=industry, is_active=True)
-
+        print("User has no relevant role")
         return Plan.objects.none()
 
     @swagger_helper("Plan", "create")
@@ -151,11 +172,11 @@ class SubscriptionView(viewsets.ModelViewSet):
 
     def get_queryset(self):
         user = self.request.user
-        user_role = _extract_user_role(user)
-        if user.is_superuser or user_role == 'superuser':
+        role = getattr(self.request, 'role', None)
+        if user.is_superuser or (role and role == 'superuser'):
             return Subscription.objects.select_related('plan', 'scheduled_plan').all()
         tenant_id = getattr(user, 'tenant', None)
-        if tenant_id and user_role == 'ceo':
+        if tenant_id and role and role == 'ceo':
             try:
                 tenant_id = uuid.UUID(tenant_id)
                 return Subscription.objects.select_related('plan', 'scheduled_plan').filter(tenant_id=tenant_id)
@@ -211,26 +232,70 @@ class SubscriptionView(viewsets.ModelViewSet):
 
             return Response({'error': 'Subscription creation failed'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+    @action(detail=False, methods=['post'], url_path='activate-trial', permission_classes=[IsAuthenticated])
+    @swagger_helper("Subscriptions", "create")
+    def activate_trial(self, request):
+        """
+        Activate a 7-day free trial for a tenant/user before purchasing.
+
+        Body params (JSON):
+        - tenant_id (optional): UUID of tenant. If omitted, will try to use tenant from request.user.
+        - plan_id (optional): UUID of plan to use for the trial. If omitted, the endpoint will pick a default active plan for the tenant's industry.
+        """
+        try:
+            user = request.user
+
+            # Determine tenant_id: prefer explicit input, else try to read from user attribute
+            tenant_id = request.data.get('tenant_id') or getattr(user, 'tenant', None)
+            if not tenant_id:
+                return Response({'error': 'tenant_id is required or must be available on the authenticated user'}, status=status.HTTP_400_BAD_REQUEST)
+
+            # Determine plan: optional
+            plan_id = request.data.get('plan_id')
+            # If plan_id not provided, try to select a sensible default: first active plan for tenant industry
+            if not plan_id:
+                industry = None
+                try:
+                    client = IdentityServiceClient(request=request)
+                    tenant_info = client.get_tenant(tenant_id=tenant_id)
+                    industry = tenant_info.get('industry') if tenant_info else None
+                except Exception:
+                    industry = None
+
+                plans_qs = Plan.objects.filter(is_active=True, discontinued=False)
+                if industry:
+                    plans_qs = plans_qs.filter(industry__iexact=industry)
+
+                plan = plans_qs.first()
+                if not plan:
+                    return Response({'error': 'No available plan found to attach to trial'}, status=status.HTTP_400_BAD_REQUEST)
+                plan_id = str(plan.id)
+
+            # Use SubscriptionService to create the subscription (it enforces trial rules internally)
+            subscription_service = SubscriptionService(request)
+            subscription, result = subscription_service.create_subscription(tenant_id=str(tenant_id), plan_id=str(plan_id), user=getattr(user, 'email', None))
+
+            serializer = SubscriptionSerializer(subscription, context={'request': request})
+            return Response({'data': 'Trial activated successfully', 'subscription': serializer.data}, status=status.HTTP_201_CREATED)
+
+        except ValidationError as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            logger.exception('Failed to activate trial')
+            return Response({'error': 'Failed to activate trial', 'details': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
     @swagger_helper("Subscriptions", "list")
     def list(self, request, *args, **kwargs):
         try:
-            cache_key = f"subscriptions_{request.user.id}_{request.GET.urlencode()}"
-            cached_result = cache.get(cache_key)
-            if cached_result:
-                return Response(cached_result)
-
             queryset = self.get_queryset()
             serializer = self.get_serializer(queryset, many=True)
             result = {
                 'count': queryset.count(),
                 'results': serializer.data
             }
-
-            cache.set(cache_key, result, 300)
             return Response(result)
 
         except Exception as e:
-
             return Response({'error': 'Failed to retrieve subscriptions'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=True, methods=['post'], url_path='renew')
@@ -406,7 +471,8 @@ class SubscriptionView(viewsets.ModelViewSet):
     @swagger_helper("Subscriptions", "check_expired_subscriptions")
     def check_expired_subscriptions(self, request):
         try:
-            if not (self.request.user.is_superuser or _extract_user_role(self.request.user) == 'superuser'):
+            role = getattr(self.request, 'role', None)
+            if not (self.request.user.is_superuser or (role and role == 'superuser')):
 
                 return Response({'error': 'Permission denied'}, status=status.HTTP_403_FORBIDDEN)
 
@@ -637,10 +703,7 @@ class AccessCheckView(viewsets.ViewSet):
                     "timestamp": timezone.now().isoformat()
                 }, status=status.HTTP_400_BAD_REQUEST)
 
-            cache_key = f"access_check_{tenant_id}"
-            cached_result = cache.get(cache_key)
-            if cached_result:
-                return Response(cached_result)
+
 
             try:
                 subscription = Subscription.objects.select_related('plan').get(tenant_id=tenant_id)
@@ -686,7 +749,7 @@ class AccessCheckView(viewsets.ViewSet):
                 "timestamp": timezone.now().isoformat()
             }
 
-            cache.set(cache_key, response_data, 60)
+
 
             return Response(response_data, status=status.HTTP_200_OK if access else status.HTTP_403_FORBIDDEN)
 
@@ -720,10 +783,7 @@ class AccessCheckView(viewsets.ViewSet):
                     "timestamp": timezone.now().isoformat()
                 }, status=status.HTTP_400_BAD_REQUEST)
 
-            cache_key = f"usage_limits_{tenant_id}"
-            cached_result = cache.get(cache_key)
-            if cached_result:
-                return Response(cached_result)
+
 
             try:
                 subscription = Subscription.objects.select_related('plan').get(tenant_id=tenant_id)
@@ -771,7 +831,7 @@ class AccessCheckView(viewsets.ViewSet):
                 "timestamp": timezone.now().isoformat()
             }
 
-            cache.set(cache_key, response_data, 120)
+
 
             return Response(response_data)
 

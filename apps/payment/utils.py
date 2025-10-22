@@ -1,7 +1,8 @@
 from rest_framework_simplejwt.tokens import RefreshToken
 from django.utils.timezone import now
-from datetime import timedelta
+from datetime import datetime, timedelta
 import requests
+import jwt
 from django.conf import settings
 
 def generate_confirm_token(user, subscription_id):
