@@ -10,7 +10,7 @@ from apps.payment.models import Payment, WebhookEvent
 from apps.payment.services import PaymentService
 from apps.billing.serializers import SubscriptionSerializer, AuditLogSerializer
 from .serializers import AnalyticsSerializer, WebhookEventSerializer
-import logging
+
 from .permissions import IsSuperuser
 from .utils import swagger_helper
 
@@ -84,11 +84,11 @@ class SuperadminPortalViewSet(viewsets.ViewSet):
 
             serializer = AnalyticsSerializer(data=analytics_data)
             serializer.is_valid(raise_exception=True)
-            logger.info(f"Analytics retrieved for period {start_date} to {end_date}")
+
             return Response(serializer.data)
 
         except Exception as e:
-            logger.error(f"Analytics retrieval failed: {str(e)}")
+
             return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @swagger_helper(tags=['Superadmin Portal'], model='Subscription')
@@ -97,14 +97,14 @@ class SuperadminPortalViewSet(viewsets.ViewSet):
         try:
             subscriptions = Subscription.objects.select_related('plan').all()
             serializer = SubscriptionSerializer(subscriptions, many=True)
-            logger.info(f"Superadmin retrieved subscription list")
+
             return Response({
                 'count': subscriptions.count(),
                 'results': serializer.data
             })
 
         except Exception as e:
-            logger.error(f"Subscription list retrieval failed: {str(e)}")
+
             return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @swagger_helper(tags=['Superadmin Portal'], model='Subscription Audit Log')
@@ -114,7 +114,7 @@ class SuperadminPortalViewSet(viewsets.ViewSet):
             subscription = Subscription.objects.get(id=pk)
             audit_logs = subscription.audit_logs.all()[:100]
             serializer = AuditLogSerializer(audit_logs, many=True)
-            logger.info(f"Audit logs retrieved for subscription {pk}")
+
             return Response({
                 'subscription_id': str(subscription.id),
                 'audit_logs': serializer.data,
@@ -122,10 +122,10 @@ class SuperadminPortalViewSet(viewsets.ViewSet):
             })
 
         except Subscription.DoesNotExist:
-            logger.error(f"Audit logs retrieval failed: Subscription {pk} not found")
+
             return Response({'error': 'Subscription not found'}, status=status.HTTP_404_NOT_FOUND)
         except Exception as e:
-            logger.error(f"Audit logs retrieval failed: {str(e)}")
+
             return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @swagger_helper(tags=['Superadmin Portal'], model='Webhook Event')
@@ -134,11 +134,11 @@ class SuperadminPortalViewSet(viewsets.ViewSet):
         try:
             payment_service = PaymentService(request)
             result = payment_service.retry_webhook(webhook_event_id=pk)
-            logger.info(f"Webhook retry initiated for event {pk}: {result['status']}")
+
             return Response(result)
 
         except Exception as e:
-            logger.error(f"Webhook retry failed for event {pk}: {str(e)}")
+
             return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @swagger_helper(tags=['Superadmin Portal'], model='Webhook Event')
@@ -147,12 +147,12 @@ class SuperadminPortalViewSet(viewsets.ViewSet):
         try:
             webhook_events = WebhookEvent.objects.all().order_by('-created_at')[:100]
             serializer = WebhookEventSerializer(webhook_events, many=True)
-            logger.info(f"Webhook events retrieved by superadmin")
+
             return Response({
                 'count': webhook_events.count(),
                 'results': serializer.data
             })
 
         except Exception as e:
-            logger.error(f"Webhook events retrieval failed: {str(e)}")
+
             return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)

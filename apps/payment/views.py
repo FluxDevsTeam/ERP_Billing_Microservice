@@ -4,6 +4,11 @@ from rest_framework.response import Response
 from rest_framework.decorators import action
 from django.shortcuts import get_object_or_404, redirect
 from django.views.decorators.csrf import csrf_exempt
+from django.core.exceptions import ValidationError
+from apps.billing.utils import send_email_via_service
+
+
+
 import requests
 import hmac
 import hashlib
@@ -34,14 +39,26 @@ class PaymentRefundViewSet(viewsets.ViewSet):
             reason = request.data.get('reason', 'Refund requested')
             result = payment_service.refund_payment(payment_id=pk, reason=reason)
 
-            logger.info(f"Refund attempt for payment {pk}: {result['status']}")
+            if result['status'] == 'success':
+                # Send refund confirmation email
+                payment = Payment.objects.get(id=pk)
+                email_data = {
+                    'user_email': request.user.email,
+                    'email_type': 'confirmation',
+                    'subject': 'Refund Processed',
+                    'message': f'Your refund request for payment {pk} has been processed. Reason: {reason}',
+                    'action': 'Refund Processed'
+                }
+                send_email_via_service(email_data)
+
+
             return Response(result, status=status.HTTP_200_OK if result['status'] == 'success' else status.HTTP_400_BAD_REQUEST)
 
         except ValidationError as e:
-            logger.warning(f"Refund failed for payment {pk}: {str(e)}")
+
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
         except Exception as e:
-            logger.error(f"Refund failed for payment {pk}: {str(e)}")
+
             return Response({'error': 'Refund processing failed'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
@@ -214,6 +231,18 @@ class PaymentInitiateViewSet(viewsets.ModelViewSet):
             if response.status_code == 200:
                 payment.transaction_id = response.data.get('tx_ref')
                 payment.save()
+                
+                # Send payment initiation email
+                email_data = {
+                    'user_email': request.user.email,
+                    'email_type': 'confirmation',
+                    'subject': 'Payment Initiated',
+                    'message': f'Your payment of {amount} for {plan.name} plan has been initiated. Please complete the payment process.',
+                    'action': 'Payment Initiated',
+                    'link': response.data.get('authorization_url', ''),
+                    'link_text': 'Complete Payment'
+                }
+                send_email_via_service(email_data)
             else:
                 payment.status = 'failed'
                 payment.save()
@@ -304,6 +333,16 @@ class PaymentVerifyViewSet(viewsets.ViewSet):
                 if payment:
                     payment.status = 'failed'
                     payment.save()
+                    # Send payment failure email
+                    if user and user.email:
+                        email_data = {
+                            'user_email': user.email,
+                            'email_type': 'general',
+                            'subject': 'Payment Failed',
+                            'message': 'Your payment could not be verified. Please try again or contact support.',
+                            'action': 'Payment Failed'
+                        }
+                        send_email_via_service(email_data)
                 pass
                 return redirect(f"{settings.FRONTEND_PATH}/payment-failed/?data=Payment-verification-failed")
 
@@ -336,7 +375,17 @@ class PaymentVerifyViewSet(viewsets.ViewSet):
             base_date = subscription.end_date if subscription.end_date and subscription.end_date > timezone.now() else timezone.now()
             subscription.end_date = base_date + timezone.timedelta(days=plan.duration_days)
             subscription.save()
-            pass
+            
+            # Send payment success email
+            if user and user.email:
+                email_data = {
+                    'user_email': user.email,
+                    'email_type': 'confirmation',
+                    'subject': 'Payment Successful',
+                    'message': f'Your payment of {amount} has been processed successfully. Your subscription to {plan.name} plan has been activated/renewed.',
+                    'action': 'Payment Successful'
+                }
+                send_email_via_service(email_data)
 
             return redirect(f"{settings.FRONTEND_PATH}/subscription/{subscription.id}")
 
@@ -411,6 +460,15 @@ class PaymentWebhookViewSet(viewsets.ViewSet):
                 if payment:
                     payment.status = 'failed'
                     payment.save()
+                    # Send payment failure email
+                    email_data = {
+                        'user_email': email,
+                        'email_type': 'general',
+                        'subject': 'Payment Failed',
+                        'message': f'Your payment of {amount} {currency} could not be processed. Please try again or contact support.',
+                        'action': 'Payment Failed'
+                    }
+                    send_email_via_service(email_data)
                 return Response({"message": "Payment not successful"}, status=200)
 
             if currency != settings.PAYMENT_CURRENCY:
@@ -491,6 +549,16 @@ class PaymentWebhookViewSet(viewsets.ViewSet):
             base_date = subscription.end_date if subscription.end_date and subscription.end_date > timezone.now() else timezone.now()
             subscription.end_date = base_date + timezone.timedelta(days=plan.duration_days)
             subscription.save()
+
+            # Send payment success email
+            email_data = {
+                'user_email': email,
+                'email_type': 'confirmation',
+                'subject': 'Payment Successful',
+                'message': f'Your payment of {amount} has been processed successfully. Your subscription has been activated/renewed.',
+                'action': 'Payment Successful'
+            }
+            send_email_via_service(email_data)
 
             return Response({"message": "Webhook processed"}, status=200)
 
