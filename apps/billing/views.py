@@ -9,18 +9,18 @@ from django.core.cache import cache
 from django.utils import timezone
 from django.core.exceptions import ValidationError
 import uuid
-import logging
+
 
 from .models import Plan, Subscription, AuditLog
 from apps.payment.models import Payment
 from .serializers import PlanSerializer, SubscriptionSerializer, PaymentSerializer, SubscriptionCreateSerializer, PlanChangeSerializer, AdvanceRenewalSerializer, AutoRenewToggleSerializer
+from .utils import send_email_via_service
 from .permissions import IsSuperuser, IsCEO, IsCEOorSuperuser, CanViewEditSubscription, PlanReadOnlyForCEO
 from .utils import IdentityServiceClient, _extract_user_role, swagger_helper
 from .services import SubscriptionService, UsageMonitorService, PaymentRetryService
 from .validators import SubscriptionValidator, UsageValidator, InputValidator
 from .circuit_breaker import CircuitBreakerManager
 
-logger = logging.getLogger('billing')
 
 
 class PlanView(viewsets.ModelViewSet):
@@ -59,7 +59,7 @@ class PlanView(viewsets.ModelViewSet):
                 cache.set(cache_key, industry, 300)
                 return base_qs.filter(industry=industry, is_active=True)
             except Exception as e:
-                logger.error(f"Plan filtering failed for tenant {tenant_id}: {str(e)}")
+
                 identity_breaker.record_failure()
                 cache_key = f"tenant_industry_{tenant_id}"
                 industry = cache.get(cache_key, 'Other')
@@ -90,13 +90,13 @@ class PlanView(viewsets.ModelViewSet):
                     errors['industry'] = [industry_error]
 
             if errors:
-                logger.warning(f"Plan creation failed: {errors}")
+
                 return Response({'errors': errors}, status=status.HTTP_400_BAD_REQUEST)
 
             return super().create(request, *args, **kwargs)
 
         except Exception as e:
-            logger.error(f"Plan creation failed: {str(e)}")
+
             return Response({'error': 'Plan creation failed'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @swagger_helper("Plan", "health_check")
@@ -113,7 +113,7 @@ class PlanView(viewsets.ModelViewSet):
                 'timestamp': timezone.now().isoformat()
             })
         except Exception as e:
-            logger.error(f"Plan health check failed: {str(e)}")
+
             return Response({
                 'status': 'unhealthy',
                 'error': str(e),
@@ -187,7 +187,17 @@ class SubscriptionView(viewsets.ModelViewSet):
                 user=str(request.user.id)
             )
 
-            logger.info(f"Subscription created: {subscription.id} for tenant {tenant_id}")
+            # Send welcome email
+            email_data = {
+                'user_email': request.user.email,
+                'email_type': 'confirmation',
+                'subject': 'Welcome to Your New Subscription',
+                'message': f'Your subscription to {subscription.plan.name} plan has been created successfully.',
+                'action': 'Subscription Created'
+            }
+            send_email_via_service(email_data)
+
+
             serializer = self.get_serializer(subscription)
             return Response({
                 'data': 'Subscription created successfully.',
@@ -195,10 +205,10 @@ class SubscriptionView(viewsets.ModelViewSet):
             }, status=status.HTTP_201_CREATED)
 
         except ValidationError as e:
-            logger.warning(f"Subscription creation failed: {str(e)}")
+
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
         except Exception as e:
-            logger.error(f"Subscription creation failed: {str(e)}")
+
             return Response({'error': 'Subscription creation failed'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @swagger_helper("Subscriptions", "list")
@@ -220,7 +230,7 @@ class SubscriptionView(viewsets.ModelViewSet):
             return Response(result)
 
         except Exception as e:
-            logger.error(f"Subscription listing failed: {str(e)}")
+
             return Response({'error': 'Failed to retrieve subscriptions'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=True, methods=['post'], url_path='renew')
@@ -233,7 +243,17 @@ class SubscriptionView(viewsets.ModelViewSet):
                 user=str(request.user.id)
             )
 
-            logger.info(f"Subscription renewed: {pk}")
+            # Send renewal confirmation email
+            email_data = {
+                'user_email': request.user.email,
+                'email_type': 'confirmation',
+                'subject': 'Subscription Renewed',
+                'message': f'Your subscription has been renewed successfully. Next renewal date: {subscription.end_date.strftime("%Y-%m-%d")}',
+                'action': 'Subscription Renewed'
+            }
+            send_email_via_service(email_data)
+
+
             serializer = self.get_serializer(subscription)
             return Response({
                 'data': 'Subscription renewed successfully.',
@@ -241,10 +261,10 @@ class SubscriptionView(viewsets.ModelViewSet):
             })
 
         except ValidationError as e:
-            logger.warning(f"Subscription renewal failed for {pk}: {str(e)}")
+
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
         except Exception as e:
-            logger.error(f"Subscription renewal failed for {pk}: {str(e)}")
+
             return Response({'error': 'Subscription renewal failed'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=True, methods=['post'], url_path='suspend')
@@ -259,7 +279,17 @@ class SubscriptionView(viewsets.ModelViewSet):
                 reason=reason
             )
 
-            logger.info(f"Subscription suspended: {pk}")
+            # Send suspension notification email
+            email_data = {
+                'user_email': request.user.email,
+                'email_type': 'general',
+                'subject': 'Subscription Suspended',
+                'message': f'Your subscription has been suspended. Reason: {reason}',
+                'action': 'Subscription Suspended'
+            }
+            send_email_via_service(email_data)
+
+
             serializer = self.get_serializer(subscription)
             return Response({
                 'data': 'Subscription suspended successfully.',
@@ -267,10 +297,10 @@ class SubscriptionView(viewsets.ModelViewSet):
             })
 
         except ValidationError as e:
-            logger.warning(f"Subscription suspension failed for {pk}: {str(e)}")
+
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
         except Exception as e:
-            logger.error(f"Subscription suspension failed for {pk}: {str(e)}")
+
             return Response({'error': 'Subscription suspension failed'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=True, methods=['post'], url_path='change-plan')
@@ -287,7 +317,17 @@ class SubscriptionView(viewsets.ModelViewSet):
                 immediate=serializer.validated_data['immediate']
             )
 
-            logger.info(f"Plan changed for subscription {pk} to {result['new_plan']}")
+            # Send plan change confirmation email
+            email_data = {
+                'user_email': request.user.email,
+                'email_type': 'confirmation',
+                'subject': 'Plan Change Confirmation',
+                'message': f'Your plan has been changed from {result["old_plan"]} to {result["new_plan"]}.',
+                'action': 'Plan Changed'
+            }
+            send_email_via_service(email_data)
+
+
             serializer = self.get_serializer(subscription)
             return Response({
                 'data': 'Plan changed successfully.',
@@ -298,10 +338,10 @@ class SubscriptionView(viewsets.ModelViewSet):
             })
 
         except ValidationError as e:
-            logger.warning(f"Plan change failed for {pk}: {str(e)}")
+
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
         except Exception as e:
-            logger.error(f"Plan change failed for {pk}: {str(e)}")
+
             return Response({'error': 'Plan change failed'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=True, methods=['post'], url_path='advance-renewal')
@@ -318,7 +358,7 @@ class SubscriptionView(viewsets.ModelViewSet):
                 user=str(request.user.id)
             )
 
-            logger.info(f"Advance renewal for subscription {pk}: {result['periods']} periods")
+
             serializer = self.get_serializer(subscription)
             return Response({
                 'data': 'Subscription renewed in advance successfully.',
@@ -328,10 +368,10 @@ class SubscriptionView(viewsets.ModelViewSet):
             })
 
         except ValidationError as e:
-            logger.warning(f"Advance renewal failed for {pk}: {str(e)}")
+
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
         except Exception as e:
-            logger.error(f"Advance renewal failed for {pk}: {str(e)}")
+
             return Response({'error': 'Advance renewal failed'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=True, methods=['post'], url_path='toggle-auto-renew')
@@ -347,7 +387,7 @@ class SubscriptionView(viewsets.ModelViewSet):
                 user=str(request.user.id)
             )
 
-            logger.info(f"Auto-renew toggled for subscription {pk}: {result['auto_renew']}")
+
             serializer = self.get_serializer(subscription)
             return Response({
                 'data': 'Auto-renew status updated successfully.',
@@ -356,10 +396,10 @@ class SubscriptionView(viewsets.ModelViewSet):
             })
 
         except ValidationError as e:
-            logger.warning(f"Auto-renew toggle failed for {pk}: {str(e)}")
+
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
         except Exception as e:
-            logger.error(f"Auto-renew toggle failed for {pk}: {str(e)}")
+
             return Response({'error': 'Auto-renew toggle failed'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=False, methods=['post'], url_path='check-expired')
@@ -367,17 +407,17 @@ class SubscriptionView(viewsets.ModelViewSet):
     def check_expired_subscriptions(self, request):
         try:
             if not (self.request.user.is_superuser or _extract_user_role(self.request.user) == 'superuser'):
-                logger.warning(f"Expired subscription check denied for user {self.request.user.id}")
+
                 return Response({'error': 'Permission denied'}, status=status.HTTP_403_FORBIDDEN)
 
             subscription_service = SubscriptionService(request)
             result = subscription_service.check_expired_subscriptions()
 
-            logger.info(f"Expired subscription check completed: {result['processed_count']} processed")
+
             return Response(result)
 
         except Exception as e:
-            logger.error(f"Expired subscription check failed: {str(e)}")
+
             return Response({'error': 'Expired subscription check failed'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=True, methods=['get'], url_path='audit-logs')
@@ -398,7 +438,7 @@ class SubscriptionView(viewsets.ModelViewSet):
                     'ip_address': log.ip_address
                 })
 
-            logger.info(f"Audit logs retrieved for subscription {pk}")
+
             return Response({
                 'subscription_id': str(subscription.id),
                 'audit_logs': logs_data,
@@ -406,7 +446,7 @@ class SubscriptionView(viewsets.ModelViewSet):
             })
 
         except Exception as e:
-            logger.error(f"Audit logs retrieval failed for {pk}: {str(e)}")
+
             return Response({'error': 'Failed to retrieve audit logs'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @swagger_helper("Subscriptions", "retrieve")
@@ -435,23 +475,23 @@ class CustomerPortalViewSet(viewsets.ViewSet):
         try:
             tenant_id = getattr(request.user, 'tenant', None)
             if not tenant_id:
-                logger.warning(f"Subscription details request failed: No tenant for user {request.user.id}")
+
                 return Response({'error': 'No tenant associated with user'}, status=status.HTTP_403_FORBIDDEN)
 
             subscription = Subscription.objects.filter(tenant_id=tenant_id).first()
             if not subscription:
-                logger.warning(f"Subscription details request failed: No subscription for tenant {tenant_id}")
+
                 return Response({'error': 'No subscription found'}, status=status.HTTP_404_NOT_FOUND)
 
             serializer = SubscriptionSerializer(subscription)
-            logger.info(f"Subscription details retrieved for tenant {tenant_id}")
+
             return Response({
                 'subscription': serializer.data,
                 'payment_history': PaymentSerializer(subscription.payments.all(), many=True).data
             })
 
         except Exception as e:
-            logger.error(f"Subscription details retrieval failed: {str(e)}")
+
             return Response({'error': 'Failed to retrieve subscription details'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=False, methods=['post'], url_path='change-plan')
@@ -460,12 +500,12 @@ class CustomerPortalViewSet(viewsets.ViewSet):
         try:
             tenant_id = getattr(request.user, 'tenant', None)
             if not tenant_id:
-                logger.warning(f"Plan change request failed: No tenant for user {request.user.id}")
+
                 return Response({'error': 'No tenant associated with user'}, status=status.HTTP_403_FORBIDDEN)
 
             subscription = Subscription.objects.filter(tenant_id=tenant_id).first()
             if not subscription:
-                logger.warning(f"Plan change request failed: No subscription for tenant {tenant_id}")
+
                 return Response({'error': 'No subscription found'}, status=status.HTTP_404_NOT_FOUND)
 
             serializer = PlanChangeSerializer(data=request.data, context={'subscription': subscription})
@@ -478,7 +518,7 @@ class CustomerPortalViewSet(viewsets.ViewSet):
                 immediate=serializer.validated_data['immediate']
             )
 
-            logger.info(f"Plan changed for tenant {tenant_id} to {result['new_plan']}")
+
             return Response({
                 'data': 'Plan changed successfully.',
                 'subscription': SubscriptionSerializer(subscription).data,
@@ -489,10 +529,10 @@ class CustomerPortalViewSet(viewsets.ViewSet):
             })
 
         except ValidationError as e:
-            logger.warning(f"Plan change failed for tenant {tenant_id}: {str(e)}")
+
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
         except Exception as e:
-            logger.error(f"Plan change failed for tenant {tenant_id}: {str(e)}")
+
             return Response({'error': 'Plan change failed'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=False, methods=['post'], url_path='advance-renewal')
@@ -501,12 +541,12 @@ class CustomerPortalViewSet(viewsets.ViewSet):
         try:
             tenant_id = getattr(request.user, 'tenant', None)
             if not tenant_id:
-                logger.warning(f"Advance renewal request failed: No tenant for user {request.user.id}")
+
                 return Response({'error': 'No tenant associated with user'}, status=status.HTTP_403_FORBIDDEN)
 
             subscription = Subscription.objects.filter(tenant_id=tenant_id).first()
             if not subscription:
-                logger.warning(f"Advance renewal request failed: No subscription for tenant {tenant_id}")
+
                 return Response({'error': 'No subscription found'}, status=status.HTTP_404_NOT_FOUND)
 
             serializer = AdvanceRenewalSerializer(data=request.data)
@@ -519,7 +559,7 @@ class CustomerPortalViewSet(viewsets.ViewSet):
                 user=str(request.user.id)
             )
 
-            logger.info(f"Advance renewal for tenant {tenant_id}: {result['periods']} periods")
+
             return Response({
                 'data': 'Subscription renewed in advance successfully.',
                 'subscription': SubscriptionSerializer(subscription).data,
@@ -528,10 +568,10 @@ class CustomerPortalViewSet(viewsets.ViewSet):
             })
 
         except ValidationError as e:
-            logger.warning(f"Advance renewal failed for tenant {tenant_id}: {str(e)}")
+
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
         except Exception as e:
-            logger.error(f"Advance renewal failed for tenant {tenant_id}: {str(e)}")
+
             return Response({'error': 'Advance renewal failed'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=False, methods=['post'], url_path='toggle-auto-renew')
@@ -540,12 +580,12 @@ class CustomerPortalViewSet(viewsets.ViewSet):
         try:
             tenant_id = getattr(request.user, 'tenant', None)
             if not tenant_id:
-                logger.warning(f"Auto-renew toggle request failed: No tenant for user {request.user.id}")
+
                 return Response({'error': 'No tenant associated with user'}, status=status.HTTP_403_FORBIDDEN)
 
             subscription = Subscription.objects.filter(tenant_id=tenant_id).first()
             if not subscription:
-                logger.warning(f"Auto-renew toggle request failed: No subscription for tenant {tenant_id}")
+
                 return Response({'error': 'No subscription found'}, status=status.HTTP_404_NOT_FOUND)
 
             serializer = AutoRenewToggleSerializer(data=request.data)
@@ -557,7 +597,7 @@ class CustomerPortalViewSet(viewsets.ViewSet):
                 user=str(request.user.id)
             )
 
-            logger.info(f"Auto-renew toggled for tenant {tenant_id}: {result['auto_renew']}")
+
             return Response({
                 'data': 'Auto-renew status updated successfully.',
                 'subscription': SubscriptionSerializer(subscription).data,
@@ -565,10 +605,10 @@ class CustomerPortalViewSet(viewsets.ViewSet):
             })
 
         except ValidationError as e:
-            logger.warning(f"Auto-renew toggle failed for tenant {tenant_id}: {str(e)}")
+
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
         except Exception as e:
-            logger.error(f"Auto-renew toggle failed for tenant {tenant_id}: {str(e)}")
+
             return Response({'error': 'Auto-renew toggle failed'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
@@ -580,7 +620,7 @@ class AccessCheckView(viewsets.ViewSet):
         try:
             tenant_id = getattr(request.user, 'tenant', None)
             if not tenant_id:
-                logger.warning(f"Access check failed: No tenant for user {request.user.id}")
+
                 return Response({
                     "access": False,
                     "message": "No tenant associated with user.",
@@ -590,7 +630,7 @@ class AccessCheckView(viewsets.ViewSet):
             try:
                 tenant_id = uuid.UUID(tenant_id)
             except ValueError:
-                logger.warning(f"Access check failed: Invalid tenant ID {tenant_id}")
+
                 return Response({
                     "access": False,
                     "message": "Invalid tenant ID format.",
@@ -605,7 +645,7 @@ class AccessCheckView(viewsets.ViewSet):
             try:
                 subscription = Subscription.objects.select_related('plan').get(tenant_id=tenant_id)
             except Subscription.DoesNotExist:
-                logger.warning(f"Access check failed: No subscription for tenant {tenant_id}")
+
                 return Response({
                     "access": False,
                     "message": "No subscription found for tenant.",
@@ -647,11 +687,11 @@ class AccessCheckView(viewsets.ViewSet):
             }
 
             cache.set(cache_key, response_data, 60)
-            logger.info(f"Access check for tenant {tenant_id}: {message}")
+
             return Response(response_data, status=status.HTTP_200_OK if access else status.HTTP_403_FORBIDDEN)
 
         except Exception as e:
-            logger.error(f"Access check failed: {str(e)}")
+
             return Response({
                 "access": False,
                 "message": "Access check failed",
@@ -665,7 +705,7 @@ class AccessCheckView(viewsets.ViewSet):
         try:
             tenant_id = getattr(request.user, 'tenant', None)
             if not tenant_id:
-                logger.warning(f"Usage limits check failed: No tenant for user {request.user.id}")
+
                 return Response({
                     "error": "No tenant associated with user.",
                     "timestamp": timezone.now().isoformat()
@@ -674,7 +714,7 @@ class AccessCheckView(viewsets.ViewSet):
             try:
                 tenant_id = uuid.UUID(tenant_id)
             except ValueError:
-                logger.warning(f"Usage limits check failed: Invalid tenant ID {tenant_id}")
+
                 return Response({
                     "error": "Invalid tenant ID format.",
                     "timestamp": timezone.now().isoformat()
@@ -688,14 +728,14 @@ class AccessCheckView(viewsets.ViewSet):
             try:
                 subscription = Subscription.objects.select_related('plan').get(tenant_id=tenant_id)
             except Subscription.DoesNotExist:
-                logger.warning(f"Usage limits check failed: No subscription for tenant {tenant_id}")
+
                 return Response({
                     "error": "No subscription found for tenant.",
                     "timestamp": timezone.now().isoformat()
                 }, status=status.HTTP_403_FORBIDDEN)
 
             if subscription.status not in ['active', 'trial']:
-                logger.warning(f"Usage limits check failed: Subscription {subscription.status} for tenant {tenant_id}")
+
                 return Response({
                     "error": f"Subscription {subscription.status}.",
                     "subscription_status": subscription.status,
@@ -706,7 +746,7 @@ class AccessCheckView(viewsets.ViewSet):
             usage_data = usage_monitor.check_usage_limits(str(tenant_id))
 
             if usage_data['status'] == 'error':
-                logger.error(f"Usage limits check failed: {usage_data['message']}")
+
                 return Response({
                     "error": usage_data['message'],
                     "timestamp": timezone.now().isoformat()
@@ -732,11 +772,11 @@ class AccessCheckView(viewsets.ViewSet):
             }
 
             cache.set(cache_key, response_data, 120)
-            logger.info(f"Usage limits checked for tenant {tenant_id}")
+
             return Response(response_data)
 
         except Exception as e:
-            logger.error(f"Usage limits check failed: {str(e)}")
+
             return Response({
                 "error": "Usage limits check failed",
                 "message": str(e),
@@ -773,11 +813,11 @@ class AccessCheckView(viewsets.ViewSet):
                 'timestamp': timezone.now().isoformat()
             }
 
-            logger.info(f"Access health check: {health_data['status']}")
+
             return Response(health_data, status=200 if overall_healthy else 503)
 
         except Exception as e:
-            logger.error(f"Access health check failed: {str(e)}")
+
             return Response({
                 'status': 'unhealthy',
                 'error': str(e),
@@ -790,14 +830,14 @@ class AccessCheckView(viewsets.ViewSet):
             try:
                 tenant_id = getattr(request.user, 'tenant', None)
                 if not tenant_id:
-                    logger.warning(f"Usage validation failed: No tenant for user {request.user.id}")
+
                     return Response({
                         "error": "No tenant associated with user."
                     }, status=status.HTTP_403_FORBIDDEN)
 
                 operation = request.data.get('operation')
                 if not operation:
-                    logger.warning(f"Usage validation failed: Operation type missing")
+
                     return Response({
                         "error": "Operation type is required."
                     }, status=status.HTTP_400_BAD_REQUEST)
@@ -806,13 +846,13 @@ class AccessCheckView(viewsets.ViewSet):
                     tenant_id = uuid.UUID(tenant_id)
                     subscription = Subscription.objects.select_related('plan').get(tenant_id=tenant_id)
                 except (ValueError, Subscription.DoesNotExist):
-                    logger.warning(f"Usage validation failed: Invalid tenant or no subscription for {tenant_id}")
+
                     return Response({
                         "error": "Invalid tenant or no subscription found."
                     }, status=status.HTTP_400_BAD_REQUEST)
 
                 if subscription.status not in ['active', 'trial']:
-                    logger.warning(f"Usage validation failed: Subscription {subscription.status} for tenant {tenant_id}")
+
                     return Response({
                         "allowed": False,
                         "reason": f"Subscription is {subscription.status}"
@@ -822,7 +862,7 @@ class AccessCheckView(viewsets.ViewSet):
                 usage_data = usage_validator.validate_usage_limits(str(tenant_id), subscription.plan)
 
                 if not usage_data['valid']:
-                    logger.warning(f"Usage validation failed for tenant {tenant_id}: {usage_data['errors']}")
+
                     return Response({
                         "allowed": False,
                         "reason": "Usage limits exceeded",
@@ -834,14 +874,14 @@ class AccessCheckView(viewsets.ViewSet):
                 if operation == 'create_user':
                     current_users = usage_data['usage'].get('current_users', 0)
                     if current_users >= subscription.plan.max_users:
-                        logger.warning(f"Usage validation failed for tenant {tenant_id}: User limit exceeded")
+
                         return Response({
                             "allowed": False,
                             "reason": f"User limit ({subscription.plan.max_users}) exceeded",
                             "usage": usage_data['usage']
                         }, status=status.HTTP_403_FORBIDDEN)
                 
-                logger.info(f"Usage validation passed for tenant {tenant_id}, operation {operation}")
+
                 return Response({
                     "allowed": True,
                     "usage": usage_data['usage'],
@@ -852,7 +892,7 @@ class AccessCheckView(viewsets.ViewSet):
                 })
 
             except Exception as e:
-                logger.error(f"Usage validation failed: {str(e)}")
+
                 return Response({
                     "error": "Usage validation failed",
                     "message": str(e),
