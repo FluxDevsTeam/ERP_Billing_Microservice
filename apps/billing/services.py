@@ -14,7 +14,7 @@ from decimal import Decimal
 from .models import Plan, Subscription, AuditLog, SubscriptionCredit
 from .utils import IdentityServiceClient
 from .circuit_breaker import IdentityServiceCircuitBreaker
-from .utils.period_calculator import PeriodCalculator
+from .period_calculator import PeriodCalculator
 
 logger = logging.getLogger(__name__)
 

@@ -54,6 +54,7 @@ def initiate_flutterwave_payment(confirm_token, amount, user, plan_id, tenant_id
     except Exception as e:
         return Response({"error": "Payment processing failed. Please try again."}, status=500)
 
+
 def initiate_paystack_payment(confirm_token, amount, user, plan_id, tenant_id, tenant_name=None):
     try:
         paystack_key = settings.PAYMENT_PROVIDERS['paystack']['secret_key']
