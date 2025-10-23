@@ -75,13 +75,19 @@ class PaymentSummaryViewSet(viewsets.ModelViewSet):
             plan_switch_info = None
             restriction_info = None
 
+            # Calculate end date based on billing period
+            now = timezone.now()
+            dummy_subscription = Subscription(plan=plan, start_date=now)
+            renewal_end_date = dummy_subscription.calculate_end_date(now)
+
             # Compose base plan data
             data = {
                 "plan": {
                     "id": str(plan.id),
                     "name": plan.name,
                     "price": str(plan.price),
-                    "duration_days": plan.duration_days,
+                    "billing_period": plan.billing_period,
+                    "billing_period_display": PeriodCalculator.get_period_display(plan.billing_period, now),
                 }
             }
 
@@ -122,11 +128,9 @@ class PaymentSummaryViewSet(viewsets.ModelViewSet):
                         "allowed_branches": plan.max_branches,
                     }
 
-                now = timezone.now()
                 if subscription:
                     is_active = subscription.status == 'active' and subscription.end_date and subscription.end_date > now
                     effective_base = subscription.end_date if is_active else now
-                    renewal_end_date = effective_base + timezone.timedelta(days=plan.duration_days)
                     active_subscription_info = {
                         "has_active_subscription": is_active,
                         "current_plan_id": str(subscription.plan.id),
@@ -266,7 +270,6 @@ class PaymentVerifyViewSet(viewsets.ViewSet):
             tenant_id_param = request.query_params.get("tenant_id")
             transaction_id = request.query_params.get("transaction_id") or tx_ref
 
-
             if not all([tx_ref, amount, provider, token, plan_id_param, tenant_id_param]):
                 return redirect("https://example.com/payment-failed/?data=Invalid-request-parameters")
 
@@ -278,9 +281,7 @@ class PaymentVerifyViewSet(viewsets.ViewSet):
 
                 plan = get_object_or_404(Plan, id=plan_id_from_token)
                 user = request.user if request.user.is_authenticated else None
-                pass
-            except Exception as e:
-                pass
+            except Exception:
                 return redirect(f"{settings.FRONTEND_PATH}/payment-failed/?data=Invalid-token-or-subscription")
 
             existing_payment = Payment.objects.filter(transaction_id=tx_ref).first()
@@ -297,9 +298,7 @@ class PaymentVerifyViewSet(viewsets.ViewSet):
             try:
                 verification_response = requests.get(url, headers=headers, timeout=10)
                 verification_response.raise_for_status()
-                pass
-            except requests.exceptions.RequestException as err:
-                pass
+            except requests.exceptions.RequestException:
                 return redirect(f"{settings.FRONTEND_PATH}/payment-failed/?data=Payment-verification-failed")
 
             response_data = verification_response.json()
@@ -338,20 +337,17 @@ class PaymentVerifyViewSet(viewsets.ViewSet):
                             'action': 'Payment Failed'
                         }
                         send_email_via_service(email_data)
-                pass
                 return redirect(f"{settings.FRONTEND_PATH}/payment-failed/?data=Payment-verification-failed")
 
             payment = Payment.objects.get(transaction_id=tx_ref, plan=plan)
             payment.status = 'completed'
             payment.transaction_id = flutterwave_transaction_id if provider == "flutterwave" else transaction_id
             payment.save()
-            pass
 
             # Create or update subscription for tenant
             try:
                 tenant_uuid = uuid.UUID(tenant_id_param)
             except Exception:
-                pass
                 return redirect(f"{settings.FRONTEND_PATH}/payment-failed/?data=Invalid-tenant")
 
             current_time = timezone.now()
@@ -363,7 +359,7 @@ class PaymentVerifyViewSet(viewsets.ViewSet):
                     'start_date': current_time,
                 }
             )
-            
+
             if not created:
                 # For existing subscriptions
                 if subscription.plan != plan:
@@ -375,11 +371,11 @@ class PaymentVerifyViewSet(viewsets.ViewSet):
                 else:
                     # If expired, start fresh from current time
                     subscription.start_date = current_time
-            
+
             # Let the model calculate the end_date based on the billing period
-            subscription.end_date = None  # This will trigger end_date calculation in save()
+            subscription.end_date = None
             subscription.save()
-            
+
             # Send payment success email
             if user and user.email:
                 email_data = {
@@ -488,7 +484,7 @@ class PaymentWebhookViewSet(viewsets.ViewSet):
             try:
                 verification_response = requests.get(url, headers=headers, timeout=10)
                 verification_response.raise_for_status()
-            except requests.exceptions.RequestException as e:
+            except requests.exceptions.RequestException:
                 return Response({"error": "Payment verification failed"}, status=503)
 
             response_data = verification_response.json()
@@ -544,22 +540,23 @@ class PaymentWebhookViewSet(viewsets.ViewSet):
                     'plan': plan,
                     'status': 'active',
                     'start_date': current_time,
-                    'end_date': current_time + timezone.timedelta(days=plan.duration_days)
                 }
             )
-            
+
             if not created:
                 # For existing subscriptions
                 if subscription.plan != plan:
                     subscription.plan = plan
                 subscription.status = 'active'
-                # If current subscription is still active, extend from its end date
+                # If current subscription is still active, start from its end date
                 if subscription.end_date and subscription.end_date > current_time:
-                    subscription.end_date = subscription.end_date + timezone.timedelta(days=plan.duration_days)
+                    subscription.start_date = subscription.end_date + timezone.timedelta(days=1)
                 else:
                     # If expired, start fresh from current time
-                    subscription.end_date = current_time + timezone.timedelta(days=plan.duration_days)
-            
+                    subscription.start_date = current_time
+
+            # Let the model calculate the end_date based on the billing period
+            subscription.end_date = None  # Trigger recalculation
             subscription.save()
 
             # Send payment success email

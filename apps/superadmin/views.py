@@ -37,9 +37,20 @@ class SuperadminPortalViewSet(viewsets.ViewSet):
                 start_date__lte=end_date,
                 end_date__gte=start_date
             ).select_related('plan')
-            mrr = active_subscriptions.aggregate(
-                total=Sum(F('plan__price') / F('plan__duration_days') * 30)
-            )['total'] or 0     
+
+            # Calculate MRR based on billing_period
+            mrr = 0
+            for subscription in active_subscriptions:
+                plan = subscription.plan
+                price = float(plan.price)
+                if plan.billing_period == 'monthly':
+                    mrr += price  # Price is already monthly
+                elif plan.billing_period == 'quarterly':
+                    mrr += price / 3  # Convert quarterly price to monthly
+                elif plan.billing_period == 'biannual':
+                    mrr += price / 6  # Convert biannual price to monthly
+                elif plan.billing_period == 'annual':
+                    mrr += price / 12  # Convert annual price to monthly
 
             # Churn Rate
             canceled_subscriptions = Subscription.objects.filter(
@@ -88,7 +99,6 @@ class SuperadminPortalViewSet(viewsets.ViewSet):
             return Response(serializer.data)
 
         except Exception as e:
-
             return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @swagger_helper(tags=['Superadmin Portal'], model='Subscription')
