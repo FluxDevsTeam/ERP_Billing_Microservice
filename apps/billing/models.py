@@ -71,7 +71,13 @@ class Plan(models.Model):
     max_users = models.IntegerField(default=10)
     max_branches = models.IntegerField(default=2)
     price = models.DecimalField(max_digits=10, decimal_places=2)
-    duration_days = models.IntegerField(default=30)
+    PERIOD_CHOICES = (
+        ('monthly', 'Monthly'),
+        ('quarterly', 'Quarterly (3 months)'),
+        ('biannual', 'Bi-annual (6 months)'),
+        ('annual', 'Annual (12 months)'),
+    )
+    billing_period = models.CharField(max_length=10, choices=PERIOD_CHOICES, default='monthly')
     is_active = models.BooleanField(default=True)
     discontinued = models.BooleanField(default=False)
     tier_level = models.CharField(max_length=10, choices=TIER_CHOICES, default='tier1')
@@ -124,13 +130,38 @@ class Subscription(models.Model):
     is_first_time_subscription = models.BooleanField(default=True)
     trial_used = models.BooleanField(default=False)
 
+    def calculate_end_date(self, start_date):
+        """Calculate the end date based on the billing period"""
+        from dateutil.relativedelta import relativedelta
+        
+        if self.status == 'trial' and not self.trial_end_date:
+            # Trial period remains 7 days
+            return start_date + timezone.timedelta(days=7)
+            
+        period_mapping = {
+            'monthly': relativedelta(months=1),
+            'quarterly': relativedelta(months=3),
+            'biannual': relativedelta(months=6),
+            'annual': relativedelta(years=1),
+        }
+        
+        # Get the relative time delta based on billing period
+        delta = period_mapping.get(self.plan.billing_period)
+        if not delta:
+            # Fallback to monthly if period is not recognized
+            delta = relativedelta(months=1)
+            
+        # Calculate end date (one day before the same date next period)
+        end_date = start_date + delta - relativedelta(days=1)
+        return end_date
+
     def save(self, *args, **kwargs):
         if not self.end_date:
             if self.status == 'trial' and not self.trial_end_date:
-                self.trial_end_date = self.start_date + timezone.timedelta(days=7)
+                self.trial_end_date = self.calculate_end_date(self.start_date)
                 self.end_date = self.trial_end_date
             else:
-                self.end_date = self.start_date + timezone.timedelta(days=self.plan.duration_days)
+                self.end_date = self.calculate_end_date(self.start_date)
         
         if self.end_date < timezone.now() and self.status not in ['canceled', 'suspended']:
             self.status = 'expired'

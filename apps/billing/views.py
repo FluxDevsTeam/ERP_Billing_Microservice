@@ -109,6 +109,13 @@ class PlanView(viewsets.ModelViewSet):
                 industry_error = validator.validate_choice(industry, industry_choices, 'Industry')
                 if industry_error:
                     errors['industry'] = [industry_error]
+            
+            billing_period = request.data.get('billing_period')
+            if billing_period:
+                period_choices = [choice[0] for choice in Plan.PERIOD_CHOICES]
+                period_error = validator.validate_choice(billing_period, period_choices, 'Billing Period')
+                if period_error:
+                    errors['billing_period'] = [period_error]
 
             if errors:
 
@@ -172,10 +179,12 @@ class SubscriptionView(viewsets.ModelViewSet):
 
     def get_queryset(self):
         user = self.request.user
-        role = getattr(self.request, 'role', None)
+        role = getattr(user, 'role', None)
         if user.is_superuser or (role and role == 'superuser'):
             return Subscription.objects.select_related('plan', 'scheduled_plan').all()
         tenant_id = getattr(user, 'tenant', None)
+        print(tenant_id)
+        print(role)
         if tenant_id and role and role == 'ceo':
             try:
                 tenant_id = uuid.UUID(tenant_id)
@@ -185,9 +194,9 @@ class SubscriptionView(viewsets.ModelViewSet):
         return Subscription.objects.none()
 
     def get_permissions(self):
-        if self.action in ['list', 'create']:
+        if self.action in ['list', 'retrieve']:
             return [IsAuthenticated(), IsCEOorSuperuser()]
-        if self.action in ['retrieve', 'update', 'partial_update', 'renew_subscription', 'change_plan', 'advance_renewal', 'toggle_auto_renew']:
+        if self.action in ['create', 'update', 'partial_update', 'renew_subscription', 'change_plan', 'advance_renewal', 'toggle_auto_renew']:
             return [IsAuthenticated(), CanViewEditSubscription()]
         if self.action == 'destroy':
             return [IsAuthenticated(), IsSuperuser()]

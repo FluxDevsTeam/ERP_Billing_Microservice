@@ -12,9 +12,21 @@ class PlanSerializer(serializers.ModelSerializer):
         model = Plan
         fields = [
             'id', 'name', 'description', 'industry', 'max_users', 'max_branches', 'price',
-            'duration_days', 'is_active', 'discontinued', 'tier_level', 'created_at', 'updated_at'
+            'billing_period', 'is_active', 'discontinued', 'tier_level', 'created_at', 'updated_at'
         ]
         read_only_fields = ['created_at', 'updated_at']
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        # Add duration in days for backward compatibility
+        period_days = {
+            'monthly': 30,
+            'quarterly': 90,
+            'biannual': 180,
+            'annual': 365
+        }
+        data['duration_days'] = period_days.get(instance.billing_period, 30)
+        return data
 
 
 class SubscriptionSerializer(serializers.ModelSerializer):
@@ -32,13 +44,19 @@ class SubscriptionSerializer(serializers.ModelSerializer):
             'created_at', 'updated_at', 'suspended_at', 'canceled_at', 'auto_renew',
             'trial_end_date', 'last_payment_date', 'next_payment_date',
             'payment_retry_count', 'max_payment_retries', 'remaining_days', 'in_grace_period',
-            'is_first_time_subscription', 'trial_used'
+            'is_first_time_subscription', 'trial_used', 'billing_period_display'
         ]
         read_only_fields = [
             'status', 'start_date', 'end_date', 'created_at', 'updated_at',
             'suspended_at', 'canceled_at', 'last_payment_date', 'next_payment_date',
             'payment_retry_count', 'remaining_days', 'in_grace_period'
         ]
+
+    billing_period_display = serializers.SerializerMethodField()
+
+    def get_billing_period_display(self, obj):
+        from apps.billing.utils.period_calculator import PeriodCalculator
+        return PeriodCalculator.get_period_display(obj.plan.billing_period, obj.start_date)
 
     def get_remaining_days(self, obj):
         return obj.get_remaining_days()

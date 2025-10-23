@@ -5,10 +5,6 @@ from rest_framework.decorators import action
 from django.shortcuts import get_object_or_404, redirect
 from django.views.decorators.csrf import csrf_exempt
 from django.core.exceptions import ValidationError
-from apps.billing.utils import send_email_via_service
-
-
-
 import requests
 import hmac
 import hashlib
@@ -358,21 +354,30 @@ class PaymentVerifyViewSet(viewsets.ViewSet):
                 pass
                 return redirect(f"{settings.FRONTEND_PATH}/payment-failed/?data=Invalid-tenant")
 
-            subscription, _ = Subscription.objects.get_or_create(
+            current_time = timezone.now()
+            subscription, created = Subscription.objects.get_or_create(
                 tenant_id=tenant_uuid,
                 defaults={
                     'plan': plan,
                     'status': 'active',
-                    'start_date': timezone.now(),
-                    'end_date': timezone.now() + timezone.timedelta(days=plan.duration_days)
+                    'start_date': current_time,
                 }
             )
-            if subscription.plan != plan:
-                subscription.plan = plan
-            subscription.status = 'active'
-            # Extend from existing expiry if still active, else from now
-            base_date = subscription.end_date if subscription.end_date and subscription.end_date > timezone.now() else timezone.now()
-            subscription.end_date = base_date + timezone.timedelta(days=plan.duration_days)
+            
+            if not created:
+                # For existing subscriptions
+                if subscription.plan != plan:
+                    subscription.plan = plan
+                subscription.status = 'active'
+                # If current subscription is still active, start from its end date
+                if subscription.end_date and subscription.end_date > current_time:
+                    subscription.start_date = subscription.end_date + timezone.timedelta(days=1)
+                else:
+                    # If expired, start fresh from current time
+                    subscription.start_date = current_time
+            
+            # Let the model calculate the end_date based on the billing period
+            subscription.end_date = None  # This will trigger end_date calculation in save()
             subscription.save()
             
             # Send payment success email
@@ -532,21 +537,29 @@ class PaymentWebhookViewSet(viewsets.ViewSet):
             except Exception:
                 return Response({"error": "Invalid tenant id"}, status=400)
 
-            subscription, _ = Subscription.objects.get_or_create(
+            current_time = timezone.now()
+            subscription, created = Subscription.objects.get_or_create(
                 tenant_id=tenant_uuid,
                 defaults={
                     'plan': plan,
                     'status': 'active',
-                    'start_date': timezone.now(),
-                    'end_date': timezone.now() + timezone.timedelta(days=plan.duration_days)
+                    'start_date': current_time,
+                    'end_date': current_time + timezone.timedelta(days=plan.duration_days)
                 }
             )
-            if subscription.plan != plan:
-                subscription.plan = plan
-            subscription.status = 'active'
-            # Extend from existing expiry if still active, else from now
-            base_date = subscription.end_date if subscription.end_date and subscription.end_date > timezone.now() else timezone.now()
-            subscription.end_date = base_date + timezone.timedelta(days=plan.duration_days)
+            
+            if not created:
+                # For existing subscriptions
+                if subscription.plan != plan:
+                    subscription.plan = plan
+                subscription.status = 'active'
+                # If current subscription is still active, extend from its end date
+                if subscription.end_date and subscription.end_date > current_time:
+                    subscription.end_date = subscription.end_date + timezone.timedelta(days=plan.duration_days)
+                else:
+                    # If expired, start fresh from current time
+                    subscription.end_date = current_time + timezone.timedelta(days=plan.duration_days)
+            
             subscription.save()
 
             # Send payment success email
