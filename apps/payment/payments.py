@@ -2,7 +2,7 @@ import uuid
 import requests
 from rest_framework.response import Response
 from django.conf import settings
-from apps.billing.models import Subscription
+
 
 def initiate_flutterwave_payment(confirm_token, amount, user, plan_id, tenant_id, tenant_name=None):
     try:
@@ -78,7 +78,6 @@ def initiate_paystack_payment(confirm_token, amount, user, plan_id, tenant_id, t
             }
         }
         response = requests.post(url, headers=headers, json=data)
-
         response.raise_for_status()
         response_data = response.json()
 

@@ -22,12 +22,12 @@ from apps.billing.models import Subscription, Plan
 from .permissions import CanInitiatePayment
 from .serializers import PaymentSerializer, InitiateSerializer, PaymentSummaryInputSerializer
 from .payments import initiate_flutterwave_payment, initiate_paystack_payment
-from .utils import generate_confirm_token, initiate_refund, swagger_helper
+from .utils import initiate_refund, swagger_helper, generate_confirm_token
 from apps.billing.utils import IdentityServiceClient
 import uuid
 from django.utils import timezone
 from .services import PaymentService
-
+from api.email_service import send_email_via_service
 
 class PaymentRefundViewSet(viewsets.ViewSet):
     permission_classes = [IsAuthenticated]
@@ -175,7 +175,6 @@ class PaymentInitiateViewSet(viewsets.ModelViewSet):
             tenant_id = getattr(request.user, 'tenant', None)
             tenant_name = getattr(request.user, 'tenant_name', None)
             token = generate_confirm_token(request.user, str(plan.id))
-
             # Restrict switching if user or branch count exceeds new plan limit
             if tenant_id:
                 try:
