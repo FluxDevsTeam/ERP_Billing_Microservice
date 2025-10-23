@@ -4,7 +4,7 @@ from .models import Plan, Subscription, AuditLog, TrialUsage
 from apps.payment.models import Payment
 import logging
 
-from .utils.period_calculator import PeriodCalculator
+from apps.billing.period_calculator import PeriodCalculator
 
 logger = logging.getLogger('billing')
 
@@ -51,7 +51,7 @@ class SubscriptionSerializer(serializers.ModelSerializer):
     billing_period_display = serializers.SerializerMethodField()
 
     def get_billing_period_display(self, obj):
-        from apps.billing.utils.period_calculator import PeriodCalculator
+        from apps.billing.period_calculator import PeriodCalculator
         return PeriodCalculator.get_period_display(obj.plan.billing_period, obj.start_date)
 
     def get_remaining_days(self, obj):

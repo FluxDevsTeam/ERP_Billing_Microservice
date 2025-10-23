@@ -290,7 +290,6 @@ class SubscriptionView(viewsets.ModelViewSet):
         except ValidationError as e:
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
         except Exception as e:
-            logger.exception('Failed to activate trial')
             return Response({'error': 'Failed to activate trial', 'details': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @swagger_helper("Subscriptions", "list")

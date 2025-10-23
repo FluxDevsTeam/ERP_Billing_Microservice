@@ -24,6 +24,8 @@ import uuid
 from django.utils import timezone
 from .services import PaymentService
 from api.email_service import send_email_via_service
+from ..billing.period_calculator import PeriodCalculator
+
 
 class PaymentRefundViewSet(viewsets.ViewSet):
     permission_classes = [IsAuthenticated]
@@ -47,8 +49,8 @@ class PaymentRefundViewSet(viewsets.ViewSet):
                 }
                 send_email_via_service(email_data)
 
-
-            return Response(result, status=status.HTTP_200_OK if result['status'] == 'success' else status.HTTP_400_BAD_REQUEST)
+            return Response(result,
+                            status=status.HTTP_200_OK if result['status'] == 'success' else status.HTTP_400_BAD_REQUEST)
 
         except ValidationError as e:
 
@@ -87,7 +89,6 @@ class PaymentSummaryViewSet(viewsets.ModelViewSet):
                     "name": plan.name,
                     "price": str(plan.price),
                     "billing_period": plan.billing_period,
-                    "billing_period_display": PeriodCalculator.get_period_display(plan.billing_period, now),
                 }
             }
 
@@ -157,7 +158,8 @@ class PaymentSummaryViewSet(viewsets.ModelViewSet):
                 data["restriction"] = restriction_info
             return Response(data)
         except Exception as e:
-            return Response({"error": f"Could not generate payment summary: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            return Response({"error": f"Could not generate payment summary: {str(e)}"},
+                            status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 class PaymentInitiateViewSet(viewsets.ModelViewSet):
@@ -211,7 +213,6 @@ class PaymentInitiateViewSet(viewsets.ModelViewSet):
                                 "current_branches": current_branches_count,
                                 "allowed_branches": plan.max_branches
                             }, status=status.HTTP_400_BAD_REQUEST)
-
             payment = Payment.objects.create(
                 plan=plan,
                 amount=amount,
@@ -219,18 +220,19 @@ class PaymentInitiateViewSet(viewsets.ModelViewSet):
                 status='pending',
                 provider=provider
             )
-
             if provider == "flutterwave":
-                response = initiate_flutterwave_payment(token, amount, request.user, str(plan.id), str(tenant_id), tenant_name)
+                response = initiate_flutterwave_payment(token, amount, request.user, str(plan.id), str(tenant_id),
+                                                        tenant_name)
             elif provider == "paystack":
-                response = initiate_paystack_payment(token, amount, request.user, str(plan.id), str(tenant_id), tenant_name)
+                response = initiate_paystack_payment(token, amount, request.user, str(plan.id), str(tenant_id),
+                                                     tenant_name)
             else:
                 return Response({"error": "Invalid payment provider"}, status=status.HTTP_400_BAD_REQUEST)
 
             if response.status_code == 200:
                 payment.transaction_id = response.data.get('tx_ref')
                 payment.save()
-                
+
                 # Send payment initiation email
                 email_data = {
                     'user_email': request.user.email,
