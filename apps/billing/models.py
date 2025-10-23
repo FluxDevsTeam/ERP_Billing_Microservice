@@ -94,8 +94,6 @@ class Plan(models.Model):
             raise ValidationError("Max branches must be greater than 0")
         if self.price < 0:
             raise ValidationError("Price cannot be negative")
-        if self.duration_days <= 0:
-            raise ValidationError("Duration must be greater than 0")
 
     def __str__(self):
         return f"{self.name} ({self.industry})"

@@ -2,6 +2,7 @@ from datetime import datetime
 from dateutil.relativedelta import relativedelta
 from django.utils import timezone
 
+
 class PeriodCalculator:
     """Utility class for handling subscription period calculations"""
 
@@ -34,9 +35,9 @@ class PeriodCalculator:
         """Get human-readable period information"""
         if not start_date:
             start_date = timezone.now()
-            
+
         end_date = PeriodCalculator.calculate_end_date(start_date, billing_period)
-        
+
         return {
             'period': billing_period,
             'start_date': start_date,

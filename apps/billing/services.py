@@ -11,12 +11,16 @@ import logging
 from typing import Optional, Dict, Any, Tuple
 from decimal import Decimal
 
-from .models import Plan, Subscription, AuditLog
+from .models import Plan, Subscription, AuditLog, SubscriptionCredit
 from .utils import IdentityServiceClient
 from .circuit_breaker import IdentityServiceCircuitBreaker
+from .utils.period_calculator import PeriodCalculator
 
 logger = logging.getLogger(__name__)
 
+# Default trial duration and cooldown (can be overridden in settings)
+TRIAL_DURATION_DAYS = getattr(settings, 'SUBSCRIPTION_TRIAL_DAYS', 7)
+TRIAL_COOLDOWN_MONTHS = getattr(settings, 'TRIAL_COOLDOWN_MONTHS', 6)
 
 
 class SubscriptionService:
@@ -38,6 +42,7 @@ class SubscriptionService:
             logger.warning(f"Subscription creation failed: Plan {plan_id} is not available")
             raise ValidationError("Plan is not available")
 
+        # Check for existing active subscription
         existing_sub = Subscription.objects.filter(
             tenant_id=tenant_uuid,
             status__in=['active', 'trial', 'pending']
@@ -46,11 +51,22 @@ class SubscriptionService:
             logger.warning(f"Subscription creation blocked: Tenant {tenant_id} already has active subscription {existing_sub.id}")
             raise ValidationError("Active subscription already exists")
 
-        # Trial abuse prevention
+        # Trial eligibility check
         user_email = self.request.user.email if self.request and self.request.user else None
-        if user_email and TrialUsage.objects.filter(tenant_id=tenant_uuid, user_email=user_email).exists():
-            logger.warning(f"Trial abuse detected: Tenant {tenant_id} or user {user_email} already used trial")
-            raise ValidationError("Trial already used for this tenant or user")
+        is_trial = False
+        trial_end_date = None
+        if not Subscription.objects.filter(tenant_id=tenant_uuid).exists():
+            # Check if tenant has had a trial in the last 6 months
+            recent_trial = Subscription.objects.filter(
+                tenant_id=tenant_uuid,
+                status='trial',
+                trial_end_date__gte=timezone.now() - timezone.timedelta(days=30 * TRIAL_COOLDOWN_MONTHS)
+            ).exists()
+            if recent_trial:
+                logger.warning(f"Trial creation blocked: Tenant {tenant_id} had a recent trial")
+                raise ValidationError("Trial period already used within cooldown period")
+            is_trial = True
+            trial_end_date = timezone.now() + timezone.timedelta(days=TRIAL_DURATION_DAYS)
 
         # Check tenant compliance and usage
         tenant_info = self._get_tenant_with_fallback(tenant_id)
@@ -64,30 +80,25 @@ class SubscriptionService:
             logger.warning(f"Subscription creation failed for tenant {tenant_id}: {', '.join(switch_errors)}")
             raise ValidationError(f"Cannot create subscription: {', '.join(switch_errors)}")
 
-        is_trial = not Subscription.objects.filter(tenant_id=tenant_uuid).exists()
+        # Create subscription
         subscription = Subscription.objects.create(
             tenant_id=tenant_uuid,
             plan=plan,
             status='trial' if is_trial else 'active',
             start_date=timezone.now(),
-            trial_end_date=timezone.now() + timezone.timedelta(days=7) if is_trial else None,
-            end_date=timezone.now() + timezone.timedelta(days=7 if is_trial else plan.duration_days),
-            next_payment_date=timezone.now() + timezone.timedelta(days=7 if is_trial else plan.duration_days),
+            trial_end_date=trial_end_date,
+            end_date=None,  # Will be set by calculate_end_date in save()
+            next_payment_date=trial_end_date if is_trial else None,
             is_first_time_subscription=True,
             trial_used=is_trial
         )
-
-        if is_trial and user_email:
-            TrialUsage.objects.create(
-                tenant_id=tenant_uuid,
-                user_email=user_email,
-                trial_end_date=subscription.trial_end_date
-            )
+        # Trigger dynamic end_date calculation
+        subscription.save()
 
         self._audit_log(subscription, 'created', user, {
             'plan_name': plan.name,
             'tenant_id': str(tenant_id),
-            'duration_days': plan.duration_days,
+            'billing_period': plan.billing_period,
             'is_trial': is_trial,
             'user_email': user_email
         })
@@ -108,23 +119,22 @@ class SubscriptionService:
                 raise ValidationError("Subscription cannot be renewed")
 
             base_date = subscription.end_date if subscription.end_date > timezone.now() else timezone.now()
-            new_end_date = base_date + timezone.timedelta(days=subscription.plan.duration_days)
-
-            subscription.end_date = new_end_date
+            subscription.start_date = base_date
+            subscription.end_date = None  # Trigger dynamic calculation
             subscription.status = 'active'
             subscription.last_payment_date = timezone.now()
-            subscription.next_payment_date = new_end_date
+            subscription.next_payment_date = None  # Will be set by calculate_end_date
             subscription.payment_retry_count = 0
             subscription.save()
 
             self._audit_log(subscription, 'renewed', user, {
-                'old_end_date': subscription.end_date.isoformat(),
-                'new_end_date': new_end_date.isoformat(),
-                'plan_name': subscription.plan.name
+                'new_end_date': subscription.end_date.isoformat(),
+                'plan_name': subscription.plan.name,
+                'billing_period': subscription.plan.billing_period
             })
 
-            logger.info(f"Subscription {subscription_id} renewed until {new_end_date}")
-            return subscription, {'status': 'success', 'new_end_date': new_end_date.isoformat()}
+            logger.info(f"Subscription {subscription_id} renewed until {subscription.end_date}")
+            return subscription, {'status': 'success', 'new_end_date': subscription.end_date.isoformat()}
 
         except Subscription.DoesNotExist:
             logger.error(f"Subscription renewal failed: Subscription {subscription_id} not found")
@@ -227,8 +237,11 @@ class SubscriptionService:
                 if subscription.status == 'active' and subscription.end_date > now:
                     remaining_days = (subscription.end_date - now).days
                     if remaining_days > 0:
-                        unused_portion = (old_plan.price * remaining_days) / old_plan.duration_days
-                        new_plan_cost = (new_plan.price * remaining_days) / new_plan.duration_days
+                        # Calculate proration based on remaining time
+                        old_period_days = PeriodCalculator.get_period_delta(old_plan.billing_period).days or 365
+                        new_period_days = PeriodCalculator.get_period_delta(new_plan.billing_period).days or 365
+                        unused_portion = (old_plan.price * remaining_days) / old_period_days
+                        new_plan_cost = (new_plan.price * remaining_days) / new_period_days
                         prorated_amount = new_plan_cost - unused_portion
                         if prorated_amount < 0:
                             SubscriptionCredit.objects.create(
@@ -246,8 +259,9 @@ class SubscriptionService:
                 subscription.plan = new_plan
                 subscription.scheduled_plan = None
                 subscription.status = 'active'
-                subscription.end_date = now + timezone.timedelta(days=new_plan.duration_days)
-                subscription.next_payment_date = subscription.end_date
+                subscription.start_date = now
+                subscription.end_date = None  # Trigger dynamic calculation
+                subscription.next_payment_date = None
             else:
                 subscription.scheduled_plan = new_plan
 
@@ -296,27 +310,33 @@ class SubscriptionService:
                 raise ValidationError("Cannot renew in advance for non-active or non-expired subscription")
 
             base_date = subscription.end_date if subscription.end_date > timezone.now() else timezone.now()
-            new_end_date = base_date + timezone.timedelta(days=plan.duration_days * periods)
-
             subscription.plan = plan
-            subscription.end_date = new_end_date
+            subscription.start_date = base_date
+            subscription.end_date = None  # Trigger dynamic calculation
             subscription.status = 'active'
             subscription.last_payment_date = timezone.now()
-            subscription.next_payment_date = new_end_date
+            subscription.next_payment_date = None
             subscription.payment_retry_count = 0
             subscription.save()
 
+            # Handle multiple periods by extending end_date
+            for _ in range(periods - 1):
+                subscription.start_date = subscription.end_date
+                subscription.end_date = None
+                subscription.save()
+
             self._audit_log(subscription, 'advance_renewed', user, {
                 'periods': periods,
-                'new_end_date': new_end_date.isoformat(),
+                'new_end_date': subscription.end_date.isoformat(),
                 'plan_name': plan.name,
+                'billing_period': plan.billing_period,
                 'amount': float(plan.price * periods)
             })
 
             logger.info(f"Subscription {subscription_id} renewed in advance for {periods} periods")
             return subscription, {
                 'status': 'success',
-                'new_end_date': new_end_date.isoformat(),
+                'new_end_date': subscription.end_date.isoformat(),
                 'periods': periods,
                 'amount': float(plan.price * periods)
             }
@@ -328,6 +348,7 @@ class SubscriptionService:
             logger.error(f"Advance renewal failed: {str(e)}")
             raise ValidationError(f"Advance renewal failed: {str(e)}")
 
+    @transaction.atomic
     def check_expired_subscriptions(self) -> Dict[str, Any]:
         try:
             expired_subs = Subscription.objects.filter(
@@ -346,11 +367,13 @@ class SubscriptionService:
                     subscription.plan = subscription.scheduled_plan
                     subscription.scheduled_plan = None
                     subscription.start_date = timezone.now()
-                    subscription.end_date = timezone.now() + timezone.timedelta(days=subscription.plan.duration_days)
+                    subscription.end_date = None  # Trigger dynamic calculation
                     subscription.status = 'active'
+                    subscription.save()
                     self._audit_log(subscription, 'plan_changed', 'system', {
                         'new_plan_id': str(subscription.plan.id),
                         'new_plan_name': subscription.plan.name,
+                        'billing_period': subscription.plan.billing_period,
                         'reason': 'Scheduled plan applied after expiration'
                     })
 
@@ -400,10 +423,6 @@ class SubscriptionService:
             errors.append("Plan not available for tenant's industry")
         if plan.discontinued:
             errors.append("Plan is no longer available")
-        if plan.requires_compliance:
-            has_compliance = tenant_info.get('has_compliance_cert', False)
-            if not has_compliance:
-                errors.append("Plan requires compliance certification")
         if plan.regions:
             tenant_region = tenant_info.get('region', 'default')
             if tenant_region not in plan.regions:
@@ -475,37 +494,37 @@ class SubscriptionService:
 
 class UsageMonitorService:
     """Service for monitoring usage against plan limits"""
-    
+
     def __init__(self, request=None):
         self.request = request
-    
+
     def check_usage_limits(self, tenant_id: str) -> Dict[str, Any]:
         """Monitor usage against plan limits"""
         try:
             subscription = Subscription.objects.get(tenant_id=tenant_id)
-            
+
             if subscription.status != 'active':
                 return {
                     'status': 'inactive',
                     'message': 'Subscription is not active'
                 }
-            
+
             if self.request:
                 client = IdentityServiceClient(request=self.request)
                 users = client.get_users(tenant_id=tenant_id)
                 branches = client.get_branches(tenant_id=tenant_id)
-                
+
                 current_users = len(users) if isinstance(users, list) else 0
                 current_branches = len(branches) if isinstance(branches, list) else 0
-                
+
                 # Check soft limits (warnings)
                 user_warning = current_users > subscription.plan.max_users * 0.8
                 branch_warning = current_branches > subscription.plan.max_branches * 0.8
-                
+
                 # Check hard limits (blocking)
                 user_blocked = current_users >= subscription.plan.max_users
                 branch_blocked = current_branches >= subscription.plan.max_branches
-                
+
                 return {
                     'status': 'active',
                     'users': {
@@ -529,7 +548,7 @@ class UsageMonitorService:
                     'status': 'unknown',
                     'message': 'Unable to check usage limits'
                 }
-                
+
         except Subscription.DoesNotExist:
             return {
                 'status': 'not_found',
@@ -541,12 +560,12 @@ class UsageMonitorService:
                 'status': 'error',
                 'message': str(e)
             }
-    
+
     def get_subscription_info(self, tenant_id: str) -> Dict[str, Any]:
         """Get subscription information without overage charges"""
         try:
             subscription = Subscription.objects.get(tenant_id=tenant_id)
-            
+
             return {
                 'subscription_id': str(subscription.id),
                 'plan_name': subscription.plan.name,
@@ -557,7 +576,7 @@ class UsageMonitorService:
                 'remaining_days': subscription.get_remaining_days(),
                 'auto_renew': subscription.auto_renew
             }
-                
+
         except Subscription.DoesNotExist:
             return {
                 'error': 'No subscription found for tenant'
@@ -571,32 +590,32 @@ class UsageMonitorService:
 
 class PaymentRetryService:
     """Service for managing payment retries and dunning"""
-    
+
     def __init__(self, request=None):
         self.request = request
-    
+
     def should_retry_payment(self, subscription: Subscription) -> bool:
         """Check if payment should be retried"""
         if subscription.payment_retry_count >= subscription.max_payment_retries:
             return False
-        
+
         # Check if enough time has passed since last retry
         if subscription.last_payment_date:
             retry_intervals = [1, 3, 7]  # days
             days_since_last = (timezone.now() - subscription.last_payment_date).days
             required_interval = retry_intervals[min(subscription.payment_retry_count, len(retry_intervals) - 1)]
-            
+
             return days_since_last >= required_interval
-        
+
         return True
-    
+
     def increment_retry_count(self, subscription: Subscription) -> Subscription:
         """Increment payment retry count"""
         subscription.payment_retry_count += 1
         subscription.last_payment_date = timezone.now()
         subscription.save()
         return subscription
-    
+
     def handle_failed_payment(self, subscription: Subscription) -> Dict[str, Any]:
         """Handle failed payment scenarios"""
         try:
@@ -605,10 +624,10 @@ class PaymentRetryService:
                 if self.should_retry_payment(subscription):
                     # Increment retry count
                     subscription = self.increment_retry_count(subscription)
-                    
+
                     # Send payment reminder
                     self._send_payment_reminder(subscription)
-                    
+
                     return {
                         'status': 'retry_scheduled',
                         'retry_count': subscription.payment_retry_count,
@@ -619,16 +638,16 @@ class PaymentRetryService:
                     subscription.status = 'suspended'
                     subscription.suspended_at = timezone.now()
                     subscription.save()
-                    
+
                     # Disable tenant access
                     self._disable_tenant_access(subscription.tenant_id)
-                    
+
                     # Log the suspension
                     self._audit_log(subscription, 'suspended', 'system', {
                         'reason': 'max_payment_retries_reached',
                         'retry_count': subscription.payment_retry_count
                     })
-                    
+
                     return {
                         'status': 'suspended',
                         'reason': 'max_payment_retries_reached',
@@ -639,24 +658,22 @@ class PaymentRetryService:
                     'status': 'no_action',
                     'reason': 'subscription_not_active'
                 }
-                
+
         except Exception as e:
             logger.error(f"Failed payment handling failed: {str(e)}")
             return {
                 'status': 'error',
                 'message': str(e)
             }
-    
+
     def _send_payment_reminder(self, subscription: Subscription):
         """Send payment reminder to tenant"""
-        # This would integrate with your notification system
         logger.info(f"Payment reminder sent for subscription {subscription.id}")
-    
+
     def _disable_tenant_access(self, tenant_id: str):
         """Disable tenant access"""
-        # This would integrate with your access control system
         logger.info(f"Tenant access disabled for {tenant_id}")
-    
+
     def _audit_log(self, subscription: Subscription, action: str, user: str = None, details: Dict[str, Any] = None):
         """Log subscription changes for audit trail"""
         try:

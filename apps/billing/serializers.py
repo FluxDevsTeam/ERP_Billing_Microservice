@@ -4,29 +4,25 @@ from .models import Plan, Subscription, AuditLog, TrialUsage
 from apps.payment.models import Payment
 import logging
 
+from .utils.period_calculator import PeriodCalculator
+
 logger = logging.getLogger('billing')
 
 
 class PlanSerializer(serializers.ModelSerializer):
+    billing_period_display = serializers.SerializerMethodField()
+
     class Meta:
         model = Plan
         fields = [
             'id', 'name', 'description', 'industry', 'max_users', 'max_branches', 'price',
-            'billing_period', 'is_active', 'discontinued', 'tier_level', 'created_at', 'updated_at'
+            'billing_period', 'billing_period_display', 'is_active', 'discontinued', 'tier_level',
+            'created_at', 'updated_at'
         ]
         read_only_fields = ['created_at', 'updated_at']
 
-    def to_representation(self, instance):
-        data = super().to_representation(instance)
-        # Add duration in days for backward compatibility
-        period_days = {
-            'monthly': 30,
-            'quarterly': 90,
-            'biannual': 180,
-            'annual': 365
-        }
-        data['duration_days'] = period_days.get(instance.billing_period, 30)
-        return data
+    def get_billing_period_display(self, obj):
+        return PeriodCalculator.get_period_display(obj.billing_period)
 
 
 class SubscriptionSerializer(serializers.ModelSerializer):
