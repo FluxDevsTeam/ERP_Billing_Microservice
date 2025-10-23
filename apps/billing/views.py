@@ -14,12 +14,12 @@ import uuid
 from .models import Plan, Subscription, AuditLog
 from apps.payment.models import Payment
 from .serializers import PlanSerializer, SubscriptionSerializer, PaymentSerializer, SubscriptionCreateSerializer, PlanChangeSerializer, AdvanceRenewalSerializer, AutoRenewToggleSerializer
-from .utils import send_email_via_service
 from .permissions import IsSuperuser, IsCEO, IsCEOorSuperuser, CanViewEditSubscription, PlanReadOnlyForCEO
 from .utils import IdentityServiceClient, swagger_helper
 from .services import SubscriptionService, UsageMonitorService, PaymentRetryService
 from .validators import SubscriptionValidator, UsageValidator, InputValidator
 from .circuit_breaker import CircuitBreakerManager
+from api.email_service import send_email_via_service
 
 
 
