@@ -34,7 +34,7 @@ urlpatterns = [
 
     # AccessCheckView
     path('access-check/', AccessCheckView.as_view({'get': 'list'}), name='access_check'),
-    path('access-check/limits/', AccessCheckView.as_view({'get': 'check_limits'}), name='check_limits'),
+    # path('access-check/limits/', AccessCheckView.as_view({'get': 'check_limits'}), name='check_limits'),
     path('access-check/health/', AccessCheckView.as_view({'get': 'health_check'}), name='access_health_check'),
     path('access-check/validate-usage/', AccessCheckView.as_view({'post': 'validate_usage'}), name='validate_usage'),
 
