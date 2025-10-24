@@ -770,86 +770,86 @@ class AccessCheckView(viewsets.ViewSet):
                 "timestamp": timezone.now().isoformat()
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-    @action(detail=False, methods=['get'], url_path='limits')
-    @swagger_helper("Access Check", "check_limits")
-    def check_limits(self, request):
-        try:
-            tenant_id = getattr(request.user, 'tenant', None)
-            if not tenant_id:
-
-                return Response({
-                    "error": "No tenant associated with user.",
-                    "timestamp": timezone.now().isoformat()
-                }, status=status.HTTP_403_FORBIDDEN)
-
-            try:
-                tenant_id = uuid.UUID(tenant_id)
-            except ValueError:
-
-                return Response({
-                    "error": "Invalid tenant ID format.",
-                    "timestamp": timezone.now().isoformat()
-                }, status=status.HTTP_400_BAD_REQUEST)
-
-
-
-            try:
-                subscription = Subscription.objects.select_related('plan').get(tenant_id=tenant_id)
-            except Subscription.DoesNotExist:
-
-                return Response({
-                    "error": "No subscription found for tenant.",
-                    "timestamp": timezone.now().isoformat()
-                }, status=status.HTTP_403_FORBIDDEN)
-
-            if subscription.status not in ['active', 'trial']:
-
-                return Response({
-                    "error": f"Subscription {subscription.status}.",
-                    "subscription_status": subscription.status,
-                    "timestamp": timezone.now().isoformat()
-                }, status=status.HTTP_403_FORBIDDEN)
-
-            usage_monitor = UsageMonitorService(request)
-            usage_data = usage_monitor.check_usage_limits(str(tenant_id))
-
-            if usage_data['status'] == 'error':
-
-                return Response({
-                    "error": usage_data['message'],
-                    "timestamp": timezone.now().isoformat()
-                }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-            subscription_info = usage_monitor.get_subscription_info(str(tenant_id))
-
-            response_data = {
-                "tenant_id": str(tenant_id),
-                "subscription_id": str(subscription.id),
-                "plan": {
-                    "id": str(subscription.plan.id),
-                    "name": subscription.plan.name,
-                    "max_users": subscription.plan.max_users,
-                    "max_branches": subscription.plan.max_branches
-                },
-                "usage": usage_data.get('usage', {}),
-                "overall_blocked": usage_data.get('overall_blocked', False),
-                "subscription_info": subscription_info,
-                "subscription_status": subscription.status,
-                "remaining_days": subscription.get_remaining_days(),
-                "timestamp": timezone.now().isoformat()
-            }
-
-
-
-            return Response(response_data)
-
-        except Exception as e:
-
-            return Response({
-                "error": "Usage limits check failed",
-                "message": str(e),
-                "timestamp": timezone.now().isoformat()
-            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    # @action(detail=False, methods=['get'], url_path='limits')
+    # @swagger_helper("Access Check", "check_limits")
+    # def check_limits(self, request):
+    #     try:
+    #         tenant_id = getattr(request.user, 'tenant', None)
+    #         if not tenant_id:
+    #
+    #             return Response({
+    #                 "error": "No tenant associated with user.",
+    #                 "timestamp": timezone.now().isoformat()
+    #             }, status=status.HTTP_403_FORBIDDEN)
+    #
+    #         try:
+    #             tenant_id = uuid.UUID(tenant_id)
+    #         except ValueError:
+    #
+    #             return Response({
+    #                 "error": "Invalid tenant ID format.",
+    #                 "timestamp": timezone.now().isoformat()
+    #             }, status=status.HTTP_400_BAD_REQUEST)
+    #
+    #
+    #
+    #         try:
+    #             subscription = Subscription.objects.select_related('plan').get(tenant_id=tenant_id)
+    #         except Subscription.DoesNotExist:
+    #
+    #             return Response({
+    #                 "error": "No subscription found for tenant.",
+    #                 "timestamp": timezone.now().isoformat()
+    #             }, status=status.HTTP_403_FORBIDDEN)
+    #
+    #         if subscription.status not in ['active', 'trial']:
+    #
+    #             return Response({
+    #                 "error": f"Subscription {subscription.status}.",
+    #                 "subscription_status": subscription.status,
+    #                 "timestamp": timezone.now().isoformat()
+    #             }, status=status.HTTP_403_FORBIDDEN)
+    #
+    #         usage_monitor = UsageMonitorService(request)
+    #         usage_data = usage_monitor.check_usage_limits(str(tenant_id))
+    #
+    #         if usage_data['status'] == 'error':
+    #
+    #             return Response({
+    #                 "error": usage_data['message'],
+    #                 "timestamp": timezone.now().isoformat()
+    #             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    #
+    #         subscription_info = usage_monitor.get_subscription_info(str(tenant_id))
+    #
+    #         response_data = {
+    #             "tenant_id": str(tenant_id),
+    #             "subscription_id": str(subscription.id),
+    #             "plan": {
+    #                 "id": str(subscription.plan.id),
+    #                 "name": subscription.plan.name,
+    #                 "max_users": subscription.plan.max_users,
+    #                 "max_branches": subscription.plan.max_branches
+    #             },
+    #             "usage": usage_data.get('usage', {}),
+    #             "overall_blocked": usage_data.get('overall_blocked', False),
+    #             "subscription_info": subscription_info,
+    #             "subscription_status": subscription.status,
+    #             "remaining_days": subscription.get_remaining_days(),
+    #             "timestamp": timezone.now().isoformat()
+    #         }
+    #
+    #
+    #
+    #         return Response(response_data)
+    #
+    #     except Exception as e:
+    #
+    #         return Response({
+    #             "error": "Usage limits check failed",
+    #             "message": str(e),
+    #             "timestamp": timezone.now().isoformat()
+    #         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @swagger_helper("Access Check", "health_check")
     @action(detail=False, methods=['get'], url_path='health')
