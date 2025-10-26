@@ -18,9 +18,11 @@ from .period_calculator import PeriodCalculator
 
 logger = logging.getLogger(__name__)
 
-# Default trial duration and cooldown (can be overridden in settings)
-TRIAL_DURATION_DAYS = int(getattr(settings, 'TRIAL_DURATION_DAYS', 7))
-TRIAL_COOLDOWN_MONTHS = int(getattr(settings, 'TRIAL_COOLDOWN_MONTHS', 6))
+TRIAL_DURATION_DAYS = int(getattr(settings, 'SUBSCRIPTION_TRIAL_DAYS', 7))  # Cast to int
+# Handle None or invalid TRIAL_COOLDOWN_MONTHS
+TRIAL_COOLDOWN_MONTHS_DEFAULT = 6
+TRIAL_COOLDOWN_MONTHS_SETTING = getattr(settings, 'TRIAL_COOLDOWN_MONTHS', TRIAL_COOLDOWN_MONTHS_DEFAULT)
+TRIAL_COOLDOWN_MONTHS = int(TRIAL_COOLDOWN_MONTHS_SETTING) if TRIAL_COOLDOWN_MONTHS_SETTING is not None else TRIAL_COOLDOWN_MONTHS_DEFAULT
 
 
 
