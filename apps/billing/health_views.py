@@ -13,6 +13,7 @@ import logging
 
 from .circuit_breaker import CircuitBreakerManager
 from .models import Plan, Subscription, AuditLog
+from .permissions import IsSuperuser
 from .utils import IdentityServiceClient, swagger_helper
 
 logger = logging.getLogger(__name__)
@@ -20,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 class SystemHealthView(viewsets.ViewSet):
     """Comprehensive system health check"""
-    permission_classes = [AllowAny]
+    permission_classes = [IsSuperuser]
 
     @swagger_helper("System Health", "List")
     def list(self, request):
