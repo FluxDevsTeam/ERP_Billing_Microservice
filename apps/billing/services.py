@@ -19,8 +19,9 @@ from .period_calculator import PeriodCalculator
 logger = logging.getLogger(__name__)
 
 # Default trial duration and cooldown (can be overridden in settings)
-TRIAL_DURATION_DAYS = getattr(settings, 'SUBSCRIPTION_TRIAL_DAYS', 7)
-TRIAL_COOLDOWN_MONTHS = getattr(settings, 'TRIAL_COOLDOWN_MONTHS', 6)
+TRIAL_DURATION_DAYS = int(getattr(settings, 'SUBSCRIPTION_TRIAL_DAYS', 7))
+TRIAL_COOLDOWN_MONTHS = int(getattr(settings, 'TRIAL_COOLDOWN_MONTHS', 6))
+
 
 
 class SubscriptionService:
@@ -423,10 +424,6 @@ class SubscriptionService:
             errors.append("Plan not available for tenant's industry")
         if plan.discontinued:
             errors.append("Plan is no longer available")
-        if plan.regions:
-            tenant_region = tenant_info.get('region', 'default')
-            if tenant_region not in plan.regions:
-                errors.append("Plan not available in tenant's region")
         return errors
 
     def _check_usage_limits(self, tenant_id: str, plan: Plan) -> Tuple[bool, list]:
