@@ -77,12 +77,10 @@ class PaymentSummaryViewSet(viewsets.ModelViewSet):
             plan_switch_info = None
             restriction_info = None
 
-            # Calculate end date based on billing period
             now = timezone.now()
             dummy_subscription = Subscription(plan=plan, start_date=now)
             renewal_end_date = dummy_subscription.calculate_end_date(now)
 
-            # Compose base plan data
             data = {
                 "plan": {
                     "id": str(plan.id),
