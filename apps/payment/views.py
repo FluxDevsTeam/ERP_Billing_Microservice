@@ -70,6 +70,8 @@ class PaymentSummaryViewSet(viewsets.ModelViewSet):
             serializer = self.get_serializer(data=request.data)
             serializer.is_valid(raise_exception=True)
             plan = serializer.validated_data['plan_id']
+            if plan.discontinued:
+                return Response({"error", "plan is discontinued"}, status=status.HTTP_423_LOCKED)
             # Tenant context
             tenant_id_str = getattr(request.user, 'tenant', None)
             tenant_name = getattr(request.user, 'tenant_name', None)
@@ -170,6 +172,10 @@ class PaymentInitiateViewSet(viewsets.ModelViewSet):
             serializer = self.get_serializer(data=request.data)
             serializer.is_valid(raise_exception=True)
             plan = serializer.validated_data['plan_id']
+
+            if plan.discontinued:
+                return Response({"error", "plan is discontinued"}, status=status.HTTP_423_LOCKED)
+
             provider = serializer.validated_data['provider']
             amount = plan.price
             tenant_id = getattr(request.user, 'tenant', None)

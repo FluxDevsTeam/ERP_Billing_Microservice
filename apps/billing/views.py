@@ -70,7 +70,7 @@ class PlanView(viewsets.ModelViewSet):
                 if not industry:
                     print("No industry found for CEO's tenant")
                     return Plan.objects.none()
-                result = base_qs.filter(is_active=True, industry__iexact=industry)
+                result = base_qs.filter(is_active=True, industry__iexact=industry, discontinued=False)
                 print(f"Found {result.count()} plans for industry: {industry}")
                 return result
             except Exception as e:
