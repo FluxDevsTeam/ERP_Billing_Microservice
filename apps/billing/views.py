@@ -588,23 +588,19 @@ class CustomerPortalViewSet(viewsets.ViewSet):
         try:
             tenant_id = getattr(request.user, 'tenant', None)
             if not tenant_id:
-                print("CustomerPortalViewSet.get_subscription_details: No tenant associated with user")
                 return Response({'error': 'No tenant associated with user'}, status=status.HTTP_403_FORBIDDEN)
 
             subscription = Subscription.objects.filter(tenant_id=tenant_id).first()
             if not subscription:
-                print("CustomerPortalViewSet.get_subscription_details: No subscription found")
                 return Response({'error': 'No subscription found'}, status=status.HTTP_404_NOT_FOUND)
 
             serializer = SubscriptionSerializer(subscription)
-            print(f"CustomerPortalViewSet.get_subscription_details: Retrieved subscription for tenant_id={tenant_id}")
             return Response({
                 'subscription': serializer.data,
                 'payment_history': PaymentSerializer(subscription.payments.all(), many=True).data
             })
 
         except Exception as e:
-            print(f"CustomerPortalViewSet.get_subscription_details: Unexpected error - {str(e)}")
             return Response({'error': 'Failed to retrieve subscription details'},
                             status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
