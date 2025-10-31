@@ -471,8 +471,6 @@ class SubscriptionView(viewsets.ModelViewSet):
             )
 
             serializer = SubscriptionSerializer(subscription)
-            print(
-                f"SubscriptionView.toggle_auto_renew: Auto-renew toggled to {serializer.validated_data['auto_renew']} for subscription_id={pk}")
             return Response({
                 'data': 'Auto-renew status updated successfully.',
                 'subscription': serializer.data,
@@ -480,10 +478,8 @@ class SubscriptionView(viewsets.ModelViewSet):
             })
 
         except ValidationError as e:
-            print(f"SubscriptionView.toggle_auto_renew: Validation error - {str(e)}")
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
         except Exception as e:
-            print(f"SubscriptionView.toggle_auto_renew: Unexpected error - {str(e)}")
             return Response({'error': 'Auto-renew toggle failed'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=False, methods=['post'], url_path='check-expired')

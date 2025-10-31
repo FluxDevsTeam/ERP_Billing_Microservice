@@ -25,7 +25,6 @@ TRIAL_COOLDOWN_MONTHS_SETTING = getattr(settings, 'TRIAL_COOLDOWN_MONTHS', TRIAL
 TRIAL_COOLDOWN_MONTHS = int(TRIAL_COOLDOWN_MONTHS_SETTING) if TRIAL_COOLDOWN_MONTHS_SETTING is not None else TRIAL_COOLDOWN_MONTHS_DEFAULT
 
 
-
 class SubscriptionService:
     def __init__(self, request=None):
         self.request = request
@@ -151,30 +150,20 @@ class SubscriptionService:
         try:
             subscription = Subscription.objects.get(id=subscription_id)
             if subscription.status not in ['active', 'trial']:
-                logger.warning(f"Auto-renew toggle failed for subscription {subscription_id}: Invalid status {subscription.status}")
                 raise ValidationError("Cannot toggle auto-renew for non-active subscription")
 
             subscription.auto_renew = auto_renew
-            if not auto_renew:
-                subscription.canceled_at = timezone.now() if subscription.status != 'trial' else None
-                subscription.status = 'canceled' if subscription.status != 'trial' else 'trial'
-            else:
-                subscription.canceled_at = None
-                subscription.status = 'active' if subscription.status != 'trial' else 'trial'
-            subscription.save()
 
             self._audit_log(subscription, 'auto_renew_toggled', user, {
                 'auto_renew': auto_renew,
                 'previous_status': subscription.status,
                 'tenant_id': str(subscription.tenant_id)
             })
-
-            logger.info(f"Subscription {subscription_id} auto-renew set to {auto_renew}")
             return subscription, {'status': 'success', 'auto_renew': auto_renew}
 
         except Subscription.DoesNotExist:
-            logger.error(f"Auto-renew toggle failed: Subscription {subscription_id} not found")
             raise ValidationError("Subscription not found")
+
         except Exception as e:
             logger.error(f"Auto-renew toggle failed: {str(e)}")
             raise ValidationError(f"Auto-renew toggle failed: {str(e)}")
