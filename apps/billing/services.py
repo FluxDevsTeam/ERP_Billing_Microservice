@@ -117,15 +117,14 @@ class SubscriptionService:
         try:
             subscription = Subscription.objects.get(id=subscription_id)
             if not subscription.can_be_renewed():
-                logger.warning(f"Subscription {subscription_id} renewal failed: Not eligible for renewal")
                 raise ValidationError("Subscription cannot be renewed")
 
             base_date = subscription.end_date if subscription.end_date > timezone.now() else timezone.now()
             subscription.start_date = base_date
-            subscription.end_date = None  # Trigger dynamic calculation
+            subscription.end_date = None
             subscription.status = 'active'
             subscription.last_payment_date = timezone.now()
-            subscription.next_payment_date = None  # Will be set by calculate_end_date
+            subscription.next_payment_date = None
             subscription.payment_retry_count = 0
             subscription.save()
 
@@ -135,14 +134,11 @@ class SubscriptionService:
                 'billing_period': subscription.plan.billing_period
             })
 
-            logger.info(f"Subscription {subscription_id} renewed until {subscription.end_date}")
             return subscription, {'status': 'success', 'new_end_date': subscription.end_date.isoformat()}
 
         except Subscription.DoesNotExist:
-            logger.error(f"Subscription renewal failed: Subscription {subscription_id} not found")
             raise ValidationError("Subscription not found")
         except Exception as e:
-            logger.error(f"Subscription renewal failed: {str(e)}")
             raise ValidationError(f"Subscription renewal failed: {str(e)}")
 
     @transaction.atomic
