@@ -44,7 +44,6 @@ class SubscriptionService:
             logger.warning(f"Subscription creation failed: Plan {plan_id} is not available")
             raise ValidationError("Plan is not available")
 
-        # Check for existing active subscription
         existing_sub = Subscription.objects.filter(
             tenant_id=tenant_uuid,
             status__in=['active', 'trial', 'pending']
@@ -58,7 +57,6 @@ class SubscriptionService:
         is_trial = False
         trial_end_date = None
         if not Subscription.objects.filter(tenant_id=tenant_uuid).exists():
-            # Check if tenant has had a trial in the last 6 months
             recent_trial = Subscription.objects.filter(
                 tenant_id=tenant_uuid,
                 status='trial',
@@ -82,7 +80,6 @@ class SubscriptionService:
             logger.warning(f"Subscription creation failed for tenant {tenant_id}: {', '.join(switch_errors)}")
             raise ValidationError(f"Cannot create subscription: {', '.join(switch_errors)}")
 
-        # Create subscription
         subscription = Subscription.objects.create(
             tenant_id=tenant_uuid,
             plan=plan,
