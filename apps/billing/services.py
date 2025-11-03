@@ -18,8 +18,7 @@ from .period_calculator import PeriodCalculator
 
 logger = logging.getLogger(__name__)
 
-TRIAL_DURATION_DAYS = int(getattr(settings, 'SUBSCRIPTION_TRIAL_DAYS', 7))  # Cast to int
-# Handle None or invalid TRIAL_COOLDOWN_MONTHS
+TRIAL_DURATION_DAYS = int(getattr(settings, 'SUBSCRIPTION_TRIAL_DAYS', 7))
 TRIAL_COOLDOWN_MONTHS_DEFAULT = 6
 TRIAL_COOLDOWN_MONTHS_SETTING = getattr(settings, 'TRIAL_COOLDOWN_MONTHS', TRIAL_COOLDOWN_MONTHS_DEFAULT)
 TRIAL_COOLDOWN_MONTHS = int(TRIAL_COOLDOWN_MONTHS_SETTING) if TRIAL_COOLDOWN_MONTHS_SETTING is not None else TRIAL_COOLDOWN_MONTHS_DEFAULT
@@ -52,7 +51,6 @@ class SubscriptionService:
             logger.warning(f"Subscription creation blocked: Tenant {tenant_id} already has active subscription {existing_sub.id}")
             raise ValidationError("Active subscription already exists")
 
-        # Trial eligibility check
         user_email = self.request.user.email if self.request and self.request.user else None
         is_trial = False
         trial_end_date = None
@@ -68,7 +66,6 @@ class SubscriptionService:
             is_trial = True
             trial_end_date = timezone.now() + timezone.timedelta(days=TRIAL_DURATION_DAYS)
 
-        # Check tenant compliance and usage
         tenant_info = self._get_tenant_with_fallback(tenant_id)
         errors = self._validate_business_rules(tenant_info or {}, plan)
         if errors:
@@ -86,12 +83,11 @@ class SubscriptionService:
             status='trial' if is_trial else 'active',
             start_date=timezone.now(),
             trial_end_date=trial_end_date,
-            end_date=None,  # Will be set by calculate_end_date in save()
+            end_date=None,
             next_payment_date=trial_end_date if is_trial else None,
             is_first_time_subscription=True,
             trial_used=is_trial
         )
-        # Trigger dynamic end_date calculation
         subscription.save()
 
         self._audit_log(subscription, 'created', user, {
