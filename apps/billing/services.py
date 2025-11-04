@@ -1,6 +1,3 @@
-"""
-Business logic services for subscription management
-"""
 from django.db import transaction
 from django.utils import timezone
 from django.core.exceptions import ValidationError
@@ -218,7 +215,6 @@ class SubscriptionService:
                 if subscription.status == 'active' and subscription.end_date > now:
                     remaining_days = (subscription.end_date - now).days
                     if remaining_days > 0:
-                        # Calculate proration based on remaining time
                         old_period_days = PeriodCalculator.get_period_delta(old_plan.billing_period).days or 365
                         new_period_days = PeriodCalculator.get_period_delta(new_plan.billing_period).days or 365
                         unused_portion = (old_plan.price * remaining_days) / old_period_days
@@ -241,7 +237,7 @@ class SubscriptionService:
                 subscription.scheduled_plan = None
                 subscription.status = 'active'
                 subscription.start_date = now
-                subscription.end_date = None  # Trigger dynamic calculation
+                subscription.end_date = None
                 subscription.next_payment_date = None
             else:
                 subscription.scheduled_plan = new_plan
