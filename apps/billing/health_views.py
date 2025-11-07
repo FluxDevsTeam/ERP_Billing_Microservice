@@ -240,7 +240,6 @@ class SystemHealthView(viewsets.ViewSet):
                 },
                 'performance_metrics': self._get_performance_metrics(),
                 'recent_activity': self._get_recent_activity(),
-                'error_logs': self._get_recent_errors()
             }
             
             return Response(health_data)
@@ -293,18 +292,6 @@ class SystemHealthView(viewsets.ViewSet):
             return {
                 'recent_audit_logs': activity,
                 'total_audit_logs': AuditLog.objects.count()
-            }
-        except Exception as e:
-            return {'error': str(e)}
-
-    def _get_recent_errors(self):
-        """Get recent error information"""
-        try:
-            # This would typically query your logging system
-            # For now, we'll return a placeholder
-            return {
-                'recent_errors': [],
-                'error_rate': '0%'
             }
         except Exception as e:
             return {'error': str(e)}
