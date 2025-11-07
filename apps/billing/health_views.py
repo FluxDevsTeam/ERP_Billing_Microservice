@@ -57,7 +57,7 @@ class SystemHealthView(viewsets.ViewSet):
 
             # Determine overall health
             all_healthy = all(
-                component.get('status') == 'healthy' 
+                component.get('status') == 'healthy'
                 for component in health_data['components'].values()
             )
             
@@ -159,7 +159,7 @@ class SystemHealthView(viewsets.ViewSet):
                 'status': 'healthy',
                 'configured': True
             }
-        
+        services['status'] = 'healthy'
         return services
 
     def _check_circuit_breakers(self):

@@ -17,7 +17,7 @@ from .serializers import (
     PlanSerializer, SubscriptionSerializer, PaymentSerializer,
     SubscriptionCreateSerializer, TrialActivationSerializer,
     SubscriptionRenewSerializer, SubscriptionSuspendSerializer,
-    PlanChangeSerializer, AdvanceRenewalSerializer, AutoRenewToggleSerializer
+    PlanChangeSerializer, AdvanceRenewalSerializer, AutoRenewToggleSerializer, AuditLogSerializer
 )
 from .permissions import IsSuperuser, IsCEO, IsCEOorSuperuser, CanViewEditSubscription, PlanReadOnlyForCEO
 from .utils import IdentityServiceClient, swagger_helper
