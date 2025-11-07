@@ -29,11 +29,14 @@ class AuditLog(models.Model):
         ('advance_renewed', 'Advance Renewed'),
         ('auto_renew_toggled', 'Auto-Renew Toggled'),
         ('proration_credited', 'Proration Credited'),
+        ('auto_renew_processed', 'Auto-Renew Processed'),
+        ('auto_renew_failed', 'Auto-Renew Failed'),
+        ('plan_deprecated_handled', 'Plan Deprecated Handled'),
     )
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     subscription = models.ForeignKey('Subscription', on_delete=models.CASCADE, related_name='audit_logs')
-    action = models.CharField(max_length=20, choices=ACTION_CHOICES)
+    action = models.CharField(max_length=50, choices=ACTION_CHOICES)
     user = models.CharField(max_length=255, null=True, blank=True)
     details = models.JSONField(default=dict, blank=True)
     timestamp = models.DateTimeField(auto_now_add=True)
@@ -173,7 +176,17 @@ class Subscription(models.Model):
         return False
 
     def can_be_renewed(self):
-        return self.status in ['active', 'expired'] and self.auto_renew
+        """Check if subscription can be renewed (either via auto_renew field for backwards compatibility or via AutoRenewal)"""
+        if self.status not in ['active', 'expired']:
+            return False
+        
+        # Check if there's an active AutoRenewal
+        active_auto_renewal = self.auto_renewals.filter(status='active').first()
+        if active_auto_renewal:
+            return True
+        
+        # Fallback to auto_renew field for backwards compatibility
+        return self.auto_renew
 
     def get_remaining_days(self):
         if self.status != 'active':
@@ -183,6 +196,67 @@ class Subscription(models.Model):
 
     def __str__(self):
         return f"Subscription for Tenant {self.tenant_id} - {self.plan.name}"
+
+
+class AutoRenewal(models.Model):
+    """Model to handle auto-renewal of subscriptions"""
+    STATUS_CHOICES = (
+        ('active', 'Active'),
+        ('paused', 'Paused'),
+        ('canceled', 'Canceled'),
+        ('processing', 'Processing'),
+        ('failed', 'Failed'),
+    )
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    tenant_id = models.UUIDField(help_text="Tenant identifier for the subscription")
+    user_id = models.CharField(max_length=255, null=True, blank=True, help_text="User identifier who set up the auto-renewal")
+    subscription = models.ForeignKey(Subscription, on_delete=models.CASCADE, related_name='auto_renewals', null=True, blank=True, help_text="Optional reference to subscription")
+    plan = models.ForeignKey(Plan, on_delete=models.SET_NULL, null=True, related_name='auto_renewals', help_text="Plan to renew to")
+    expiry_date = models.DateTimeField(help_text="Date when the current subscription period expires")
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='active')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    last_renewal_at = models.DateTimeField(null=True, blank=True, help_text="Last successful renewal timestamp")
+    next_renewal_date = models.DateTimeField(null=True, blank=True, help_text="Next scheduled renewal date")
+    failure_count = models.IntegerField(default=0, help_text="Number of consecutive renewal failures")
+    max_failures = models.IntegerField(default=3, help_text="Maximum allowed failures before auto-pause")
+    notes = models.TextField(blank=True, help_text="Additional notes about the auto-renewal")
+
+    class Meta:
+        unique_together = [('tenant_id', 'plan')]
+        ordering = ['expiry_date']
+        indexes = [
+            models.Index(fields=['tenant_id', 'status']),
+            models.Index(fields=['expiry_date', 'status']),
+            models.Index(fields=['status', 'next_renewal_date']),
+        ]
+
+    def __str__(self):
+        return f"AutoRenewal for Tenant {self.tenant_id} - {self.plan.name if self.plan else 'No Plan'}"
+
+    def is_due_for_renewal(self):
+        """Check if the auto-renewal is due"""
+        if self.status != 'active':
+            return False
+        if not self.next_renewal_date:
+            # If no next_renewal_date set, use expiry_date
+            return timezone.now() >= self.expiry_date
+        return timezone.now() >= self.next_renewal_date
+
+    def can_renew(self):
+        """Check if the auto-renewal can be processed"""
+        if self.status != 'active':
+            return False, f"Auto-renewal status is {self.status}"
+        if self.failure_count >= self.max_failures:
+            return False, f"Maximum failure count ({self.max_failures}) reached"
+        if not self.plan:
+            return False, "No plan associated with auto-renewal"
+        if self.plan.discontinued:
+            return False, "Plan is discontinued"
+        if not self.plan.is_active:
+            return False, "Plan is not active"
+        return True, "OK"
 
 
 class SubscriptionCredit(models.Model):
@@ -200,11 +274,24 @@ class SubscriptionCredit(models.Model):
 
 class TrialUsage(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    tenant_id = models.UUIDField(unique=True)
+    tenant_id = models.UUIDField(null=True, blank=True, help_text="Tenant identifier (nullable for machine-only tracking)")
     user_email = models.EmailField()
+    machine_number = models.CharField(max_length=255, null=True, blank=True, db_index=True, help_text="Machine identifier to prevent multiple trial usage from one machine")
     trial_start_date = models.DateTimeField(default=timezone.now)
     trial_end_date = models.DateTimeField()
     created_at = models.DateTimeField(auto_now_add=True)
+    ip_address = models.GenericIPAddressField(null=True, blank=True, help_text="IP address when trial was created")
+
+    class Meta:
+        # Machine number must be unique to prevent multiple trials from same machine
+        # This enforces machine-level trial prevention regardless of tenant
+        constraints = [
+            models.UniqueConstraint(fields=['machine_number'], name='unique_machine_trial'),
+        ]
+        indexes = [
+            models.Index(fields=['machine_number']),
+            models.Index(fields=['tenant_id', 'machine_number']),
+        ]
 
     def __str__(self):
-        return f"Trial for Tenant {self.tenant_id} - {self.user_email}"
+        return f"Trial for Tenant {self.tenant_id} - {self.user_email} - Machine: {self.machine_number}"
