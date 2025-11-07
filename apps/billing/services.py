@@ -92,7 +92,7 @@ class SubscriptionService:
 
         # Handle trial creation
         if is_trial:
-            # Check machine number for trial abuse prevention
+            # Check machine number for trial abuse prevention (only if provided)
             if machine_number:
                 machine_trial_exists = TrialUsage.objects.filter(
                     machine_number=machine_number

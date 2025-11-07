@@ -10,18 +10,22 @@ from django.core.cache import cache
 from django.utils import timezone
 from django.core.exceptions import ValidationError
 import uuid
+import logging
 
-from .models import Plan, Subscription, AuditLog
+logger = logging.getLogger(__name__)
+
+from .models import Plan, Subscription, AuditLog, AutoRenewal
 from apps.payment.models import Payment
 from .serializers import (
     PlanSerializer, SubscriptionSerializer, PaymentSerializer,
     SubscriptionCreateSerializer, TrialActivationSerializer,
     SubscriptionRenewSerializer, SubscriptionSuspendSerializer,
-    PlanChangeSerializer, AdvanceRenewalSerializer, AutoRenewToggleSerializer, AuditLogSerializer
+    PlanChangeSerializer, AdvanceRenewalSerializer, AutoRenewToggleSerializer, AuditLogSerializer,
+    AutoRenewalSerializer, AutoRenewalCreateSerializer, AutoRenewalUpdateSerializer
 )
 from .permissions import IsSuperuser, IsCEO, IsCEOorSuperuser, CanViewEditSubscription, PlanReadOnlyForCEO
 from .utils import IdentityServiceClient, swagger_helper
-from .services import SubscriptionService, UsageMonitorService, PaymentRetryService
+from .services import SubscriptionService, UsageMonitorService, PaymentRetryService, AutoRenewalService
 from .validators import SubscriptionValidator, UsageValidator, InputValidator
 from .circuit_breaker import CircuitBreakerManager
 from api.email_service import send_email_via_service
@@ -187,7 +191,7 @@ class SubscriptionView(viewsets.ModelViewSet):
         if self.action in ['list', 'retrieve']:
             return [IsAuthenticated(), IsCEOorSuperuser()]
         if self.action in ['create', 'update', 'partial_update', 'renew_subscription', 'change_plan', 'advance_renewal',
-                           'toggle_auto_renew', 'suspend_subscription', 'activate_trial']:
+                           'extend_subscription', 'toggle_auto_renew', 'suspend_subscription', 'activate_trial']:
             return [IsAuthenticated(), CanViewEditSubscription()]
         if self.action == 'destroy':
             return [IsAuthenticated(), IsSuperuser()]
@@ -221,11 +225,31 @@ class SubscriptionView(viewsets.ModelViewSet):
             tenant_id = serializer.validated_data['tenant_id']
             plan_id = serializer.validated_data['plan_id']
 
+            # Check if this is a trial activation (when auto_renew is not explicitly set to False and no existing subscription)
+            is_trial = serializer.validated_data.get('is_trial', False)
+            machine_number = request.data.get('machine_number')
+            
             subscription, result = subscription_service.create_subscription(
                 tenant_id=str(tenant_id),
                 plan_id=str(plan_id),
-                user=str(request.user.id)
+                user=str(request.user.id),
+                is_trial=is_trial
             )
+
+            # Create auto-renewal if auto_renew is True (default)
+            auto_renew = serializer.validated_data.get('auto_renew', True)
+            if auto_renew:
+                try:
+                    auto_renewal_service = AutoRenewalService(request)
+                    auto_renewal_service.create_auto_renewal(
+                        tenant_id=str(tenant_id),
+                        plan_id=str(plan_id),
+                        expiry_date=subscription.end_date,
+                        user_id=str(request.user.id),
+                        subscription_id=str(subscription.id)
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to create auto-renewal for subscription {subscription.id}: {str(e)}")
 
             # Send welcome email
             email_data = {
@@ -241,7 +265,9 @@ class SubscriptionView(viewsets.ModelViewSet):
             print(f"SubscriptionView.create: Subscription created for tenant_id={tenant_id}, plan_id={plan_id}")
             return Response({
                 'data': 'Subscription created successfully.',
-                'subscription': serializer.data
+                'subscription': serializer.data,
+                'carried_days': result.get('carried_days', 0),
+                'previous_subscription_id': result.get('previous_subscription_id')
             }, status=status.HTTP_201_CREATED)
 
         except ValidationError as e:
@@ -288,17 +314,22 @@ class SubscriptionView(viewsets.ModelViewSet):
                                     status=status.HTTP_400_BAD_REQUEST)
                 plan_id = str(plan.id)
 
+            machine_number = serializer.validated_data.get('machine_number')
+            
             subscription, result = subscription_service.create_subscription(
                 tenant_id=str(tenant_id),
                 plan_id=str(plan_id),
-                user=str(request.user.email)
+                user=str(request.user.email),
+                machine_number=machine_number,
+                is_trial=True
             )
 
             serializer = SubscriptionSerializer(subscription, context={'request': request})
-            print(f"SubscriptionView.activate_trial: Trial activated for tenant_id={tenant_id}, plan_id={plan_id}")
+            print(f"SubscriptionView.activate_trial: Trial activated for tenant_id={tenant_id}, plan_id={plan_id}, machine_number={machine_number}")
             return Response({
                 'data': 'Trial activated successfully',
-                'subscription': serializer.data
+                'subscription': serializer.data,
+                'machine_number': machine_number
             }, status=status.HTTP_201_CREATED)
 
         except ValidationError as e:
@@ -395,15 +426,21 @@ class SubscriptionView(viewsets.ModelViewSet):
                 subscription_id=pk,
                 new_plan_id=serializer.validated_data['new_plan_id'],
                 user=str(request.user.id),
-                immediate=serializer.validated_data['immediate']
+                immediate=True  # Always immediate now, upgrades happen immediately, downgrades are scheduled
             )
 
             # Send plan change confirmation email
+            change_message = f'Your plan has been changed from {result["old_plan"]} to {result["new_plan"]}.'
+            if result.get('is_upgrade'):
+                change_message += f' Remaining value: {result.get("remaining_value", 0):.2f}, Amount to pay: {result.get("prorated_amount", 0):.2f}'
+            elif result.get('is_downgrade'):
+                change_message += ' Downgrade scheduled for after current period ends.'
+            
             email_data = {
                 'user_email': request.user.email,
                 'email_type': 'confirmation',
                 'subject': 'Plan Change Confirmation',
-                'message': f'Your plan has been changed from {result["old_plan"]} to {result["new_plan"]}.',
+                'message': change_message,
                 'action': 'Plan Changed'
             }
             send_email_via_service(email_data)
@@ -416,7 +453,14 @@ class SubscriptionView(viewsets.ModelViewSet):
                 'subscription': serializer.data,
                 'old_plan': result.get('old_plan'),
                 'new_plan': result.get('new_plan'),
-                'immediate': result.get('immediate')
+                'change_type': result.get('change_type'),
+                'is_upgrade': result.get('is_upgrade'),
+                'is_downgrade': result.get('is_downgrade'),
+                'prorated_amount': result.get('prorated_amount'),
+                'remaining_value': result.get('remaining_value'),
+                'remaining_days': result.get('remaining_days'),
+                'requires_payment': result.get('requires_payment'),
+                'scheduled': result.get('scheduled', False)
             })
 
         except ValidationError as e:
@@ -457,29 +501,91 @@ class SubscriptionView(viewsets.ModelViewSet):
             print(f"SubscriptionView.advance_renewal: Unexpected error - {str(e)}")
             return Response({'error': 'Advance renewal failed'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+    @action(detail=True, methods=['post'], url_path='extend')
+    @swagger_helper("Subscriptions", "extend_subscription")
+    def extend_subscription(self, request, pk=None):
+        """
+        Manually extend subscription when remaining days is below 30.
+        Adds one billing period to the existing subscription.
+        """
+        try:
+            subscription = self.get_object()
+            subscription_service = SubscriptionService(request)
+            subscription, result = subscription_service.extend_subscription(
+                subscription_id=pk,
+                user=str(request.user.id)
+            )
+
+            serializer = SubscriptionSerializer(subscription)
+            return Response({
+                'data': 'Subscription extended successfully.',
+                'subscription': serializer.data,
+                'new_end_date': result['new_end_date'],
+                'remaining_days_before': result['remaining_days_before']
+            })
+
+        except ValidationError as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            logger.error(f"Subscription extension failed: {str(e)}")
+            return Response({'error': 'Subscription extension failed'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
     @action(detail=True, methods=['post'], url_path='toggle-auto-renew')
     @swagger_helper("Subscriptions", "toggle_auto_renew")
     def toggle_auto_renew(self, request, pk=None):
         try:
             serializer = self.get_serializer(data=request.data)
             serializer.is_valid(raise_exception=True)
-            subscription_service = SubscriptionService(request)
-            subscription, result = subscription_service.toggle_auto_renew(
+            auto_renew = serializer.validated_data['auto_renew']
+            
+            subscription = self.get_object()
+            auto_renewal_service = AutoRenewalService(request)
+            
+            # Find existing auto-renewal for this subscription
+            auto_renewal = AutoRenewal.objects.filter(
                 subscription_id=pk,
-                auto_renew=serializer.validated_data['auto_renew'],
-                user=str(request.user.id)
-            )
+                status__in=['active', 'paused']
+            ).first()
+            
+            if auto_renew and not auto_renewal:
+                # Create auto-renewal
+                auto_renewal, result = auto_renewal_service.create_auto_renewal(
+                    tenant_id=str(subscription.tenant_id),
+                    plan_id=str(subscription.plan.id),
+                    expiry_date=subscription.end_date,
+                    user_id=str(request.user.id),
+                    subscription_id=pk
+                )
+                message = 'Auto-renew enabled successfully.'
+            elif not auto_renew and auto_renewal:
+                # Cancel auto-renewal
+                auto_renewal, result = auto_renewal_service.cancel_auto_renewal(
+                    auto_renewal_id=str(auto_renewal.id),
+                    user_id=str(request.user.id)
+                )
+                message = 'Auto-renew disabled successfully.'
+            elif auto_renew and auto_renewal and auto_renewal.status != 'active':
+                # Reactivate auto-renewal
+                auto_renewal, result = auto_renewal_service.update_auto_renewal(
+                    auto_renewal_id=str(auto_renewal.id),
+                    status='active',
+                    user_id=str(request.user.id)
+                )
+                message = 'Auto-renew enabled successfully.'
+            else:
+                message = 'Auto-renew status is already set as requested.'
 
             serializer = SubscriptionSerializer(subscription)
             return Response({
-                'data': 'Auto-renew status updated successfully.',
+                'data': message,
                 'subscription': serializer.data,
-                'auto_renew': result['auto_renew']
+                'auto_renew': auto_renew
             })
 
         except ValidationError as e:
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
         except Exception as e:
+            logger.error(f"Auto-renew toggle failed: {str(e)}")
             return Response({'error': 'Auto-renew toggle failed'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=False, methods=['post'], url_path='check-expired')
@@ -621,7 +727,7 @@ class CustomerPortalViewSet(viewsets.ViewSet):
                 subscription_id=str(subscription.id),
                 new_plan_id=serializer.validated_data['new_plan_id'],
                 user=str(request.user.id),
-                immediate=serializer.validated_data['immediate']
+                immediate=True
             )
 
             print(
@@ -631,8 +737,14 @@ class CustomerPortalViewSet(viewsets.ViewSet):
                 'subscription': SubscriptionSerializer(subscription).data,
                 'old_plan': result.get('old_plan'),
                 'new_plan': result.get('new_plan'),
-                'immediate': result.get('immediate'),
-                'prorated_amount': result.get('prorated_amount')
+                'change_type': result.get('change_type'),
+                'is_upgrade': result.get('is_upgrade'),
+                'is_downgrade': result.get('is_downgrade'),
+                'prorated_amount': result.get('prorated_amount'),
+                'remaining_value': result.get('remaining_value'),
+                'remaining_days': result.get('remaining_days'),
+                'requires_payment': result.get('requires_payment'),
+                'scheduled': result.get('scheduled', False)
             })
 
         except ValidationError as e:
@@ -698,19 +810,50 @@ class CustomerPortalViewSet(viewsets.ViewSet):
 
             serializer = AutoRenewToggleSerializer(data=request.data)
             serializer.is_valid(raise_exception=True)
-            subscription_service = SubscriptionService(request)
-            subscription, result = subscription_service.toggle_auto_renew(
-                subscription_id=str(subscription.id),
-                auto_renew=serializer.validated_data['auto_renew'],
-                user=str(request.user.id)
-            )
+            auto_renew = serializer.validated_data['auto_renew']
+            
+            auto_renewal_service = AutoRenewalService(request)
+            
+            # Find existing auto-renewal for this subscription
+            auto_renewal = AutoRenewal.objects.filter(
+                subscription_id=subscription.id,
+                status__in=['active', 'paused', 'canceled']
+            ).first()
+            
+            if auto_renew and not auto_renewal:
+                # Create auto-renewal
+                auto_renewal, result = auto_renewal_service.create_auto_renewal(
+                    tenant_id=str(tenant_id),
+                    plan_id=str(subscription.plan.id),
+                    expiry_date=subscription.end_date,
+                    user_id=str(request.user.id),
+                    subscription_id=str(subscription.id)
+                )
+                message = 'Auto-renew enabled successfully.'
+            elif not auto_renew and auto_renewal:
+                # Cancel auto-renewal
+                auto_renewal, result = auto_renewal_service.cancel_auto_renewal(
+                    auto_renewal_id=str(auto_renewal.id),
+                    user_id=str(request.user.id)
+                )
+                message = 'Auto-renew disabled successfully.'
+            elif auto_renew and auto_renewal and auto_renewal.status != 'active':
+                # Reactivate auto-renewal
+                auto_renewal, result = auto_renewal_service.update_auto_renewal(
+                    auto_renewal_id=str(auto_renewal.id),
+                    status='active',
+                    user_id=str(request.user.id)
+                )
+                message = 'Auto-renew enabled successfully.'
+            else:
+                message = 'Auto-renew status is already set as requested.'
 
             print(
-                f"CustomerPortalViewSet.toggle_auto_renew: Auto-renew toggled to {serializer.validated_data['auto_renew']} for subscription_id={subscription.id}")
+                f"CustomerPortalViewSet.toggle_auto_renew: Auto-renew toggled to {auto_renew} for subscription_id={subscription.id}")
             return Response({
-                'data': 'Auto-renew status updated successfully.',
+                'data': message,
                 'subscription': SubscriptionSerializer(subscription).data,
-                'auto_renew': result['auto_renew']
+                'auto_renew': auto_renew
             })
 
         except ValidationError as e:
@@ -718,7 +861,162 @@ class CustomerPortalViewSet(viewsets.ViewSet):
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
         except Exception as e:
             print(f"CustomerPortalViewSet.toggle_auto_renew: Unexpected error - {str(e)}")
+            logger.error(f"Auto-renew toggle failed: {str(e)}")
             return Response({'error': 'Auto-renew toggle failed'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    @action(detail=False, methods=['post'], url_path='extend')
+    @swagger_helper("Customer Portal", "extend_subscription")
+    def extend_subscription(self, request):
+        """Manually extend subscription when remaining days is below 30"""
+        try:
+            tenant_id = getattr(request.user, 'tenant', None)
+            if not tenant_id:
+                return Response({'error': 'No tenant associated with user'}, status=status.HTTP_403_FORBIDDEN)
+
+            subscription = Subscription.objects.filter(tenant_id=tenant_id).first()
+            if not subscription:
+                return Response({'error': 'No subscription found'}, status=status.HTTP_404_NOT_FOUND)
+
+            subscription_service = SubscriptionService(request)
+            subscription, result = subscription_service.extend_subscription(
+                subscription_id=str(subscription.id),
+                user=str(request.user.id)
+            )
+
+            return Response({
+                'data': 'Subscription extended successfully.',
+                'subscription': SubscriptionSerializer(subscription).data,
+                'new_end_date': result['new_end_date'],
+                'remaining_days_before': result['remaining_days_before']
+            })
+
+        except ValidationError as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            logger.error(f"Subscription extension failed: {str(e)}")
+            return Response({'error': 'Subscription extension failed'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+class AutoRenewalViewSet(viewsets.ModelViewSet):
+    """ViewSet for managing auto-renewals"""
+    queryset = AutoRenewal.objects.all()
+    serializer_class = AutoRenewalSerializer
+    filter_backends = [DjangoFilterBackend, SearchFilter]
+    search_fields = ['tenant_id', 'user_id']
+    filterset_fields = ['tenant_id', 'plan', 'status']
+
+    def get_queryset(self):
+        user = self.request.user
+        role = getattr(user, 'role', None)
+        
+        if user.is_superuser or (role and role.lower() == 'superuser'):
+            return AutoRenewal.objects.select_related('plan', 'subscription').all()
+        
+        tenant_id = getattr(user, 'tenant', None)
+        if tenant_id and role and role.lower() == 'ceo':
+            try:
+                tenant_id = uuid.UUID(str(tenant_id))
+                return AutoRenewal.objects.select_related('plan', 'subscription').filter(tenant_id=tenant_id)
+            except ValueError:
+                return AutoRenewal.objects.none()
+        
+        return AutoRenewal.objects.none()
+
+    def get_permissions(self):
+        if self.action in ['list', 'retrieve']:
+            return [IsAuthenticated(), IsCEOorSuperuser()]
+        return [IsAuthenticated(), CanViewEditSubscription()]
+
+    def get_serializer_class(self):
+        if self.action == 'create':
+            return AutoRenewalCreateSerializer
+        if self.action in ['update', 'partial_update']:
+            return AutoRenewalUpdateSerializer
+        return AutoRenewalSerializer
+
+    @swagger_helper("AutoRenewal", "create")
+    def create(self, request, *args, **kwargs):
+        try:
+            serializer = self.get_serializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+            auto_renewal_service = AutoRenewalService(request)
+            
+            auto_renewal, result = auto_renewal_service.create_auto_renewal(
+                tenant_id=str(serializer.validated_data['tenant_id']),
+                plan_id=str(serializer.validated_data['plan_id']),
+                expiry_date=serializer.validated_data['expiry_date'],
+                user_id=str(request.user.id),
+                subscription_id=str(serializer.validated_data.get('subscription_id')) if serializer.validated_data.get('subscription_id') else None
+            )
+            
+            response_serializer = AutoRenewalSerializer(auto_renewal)
+            return Response({
+                'data': 'Auto-renewal created successfully.',
+                'auto_renewal': response_serializer.data
+            }, status=status.HTTP_201_CREATED)
+            
+        except ValidationError as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            logger.error(f"Auto-renewal creation failed: {str(e)}")
+            return Response({'error': 'Auto-renewal creation failed'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    @action(detail=True, methods=['post'], url_path='process')
+    @swagger_helper("AutoRenewal", "process")
+    def process_renewal(self, request, pk=None):
+        """Manually trigger processing of an auto-renewal"""
+        try:
+            auto_renewal_service = AutoRenewalService(request)
+            result = auto_renewal_service.process_auto_renewal(auto_renewal_id=pk)
+            
+            return Response(result)
+            
+        except ValidationError as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            logger.error(f"Auto-renewal processing failed: {str(e)}")
+            return Response({'error': 'Auto-renewal processing failed'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    @action(detail=True, methods=['post'], url_path='cancel')
+    @swagger_helper("AutoRenewal", "cancel")
+    def cancel_renewal(self, request, pk=None):
+        """Cancel an auto-renewal"""
+        try:
+            auto_renewal_service = AutoRenewalService(request)
+            auto_renewal, result = auto_renewal_service.cancel_auto_renewal(
+                auto_renewal_id=pk,
+                user_id=str(request.user.id)
+            )
+            
+            serializer = AutoRenewalSerializer(auto_renewal)
+            return Response({
+                'data': 'Auto-renewal canceled successfully.',
+                'auto_renewal': serializer.data
+            })
+            
+        except ValidationError as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            logger.error(f"Auto-renewal cancellation failed: {str(e)}")
+            return Response({'error': 'Auto-renewal cancellation failed'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    @action(detail=False, methods=['post'], url_path='process-due')
+    @swagger_helper("AutoRenewal", "process_due")
+    def process_due_renewals(self, request):
+        """Process all due auto-renewals (admin only)"""
+        try:
+            role = getattr(request.user, 'role', None)
+            if not (request.user.is_superuser or (role and role.lower() == 'superuser')):
+                return Response({'error': 'Permission denied'}, status=status.HTTP_403_FORBIDDEN)
+            
+            auto_renewal_service = AutoRenewalService(request)
+            result = auto_renewal_service.process_due_auto_renewals()
+            
+            return Response(result)
+            
+        except Exception as e:
+            logger.error(f"Processing due auto-renewals failed: {str(e)}")
+            return Response({'error': 'Processing failed'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 class AccessCheckView(viewsets.ViewSet):
@@ -786,7 +1084,8 @@ class AccessCheckView(viewsets.ViewSet):
                 "expires_on": subscription.end_date.isoformat() if subscription.end_date else None,
                 "remaining_days": subscription.get_remaining_days(),
                 "in_grace_period": subscription.is_in_grace_period(),
-                "auto_renew": subscription.auto_renew,
+                "auto_renew": subscription.auto_renew,  # Backwards compatibility
+                "auto_renewal_active": subscription.auto_renewals.filter(status='active').exists(),
                 "timestamp": timezone.now().isoformat()
             }
 

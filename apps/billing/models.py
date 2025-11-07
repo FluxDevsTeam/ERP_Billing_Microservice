@@ -283,10 +283,14 @@ class TrialUsage(models.Model):
     ip_address = models.GenericIPAddressField(null=True, blank=True, help_text="IP address when trial was created")
 
     class Meta:
-        # Machine number must be unique to prevent multiple trials from same machine
-        # This enforces machine-level trial prevention regardless of tenant
+        # Machine number must be unique when provided to prevent multiple trials from same machine
+        # Only enforce uniqueness when machine_number is not null
         constraints = [
-            models.UniqueConstraint(fields=['machine_number'], name='unique_machine_trial'),
+            models.UniqueConstraint(
+                fields=['machine_number'], 
+                name='unique_machine_trial',
+                condition=models.Q(machine_number__isnull=False)
+            ),
         ]
         indexes = [
             models.Index(fields=['machine_number']),
@@ -294,4 +298,5 @@ class TrialUsage(models.Model):
         ]
 
     def __str__(self):
-        return f"Trial for Tenant {self.tenant_id} - {self.user_email} - Machine: {self.machine_number}"
+        machine_info = f" - Machine: {self.machine_number}" if self.machine_number else ""
+        return f"Trial for Tenant {self.tenant_id} - {self.user_email}{machine_info}"

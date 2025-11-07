@@ -1,7 +1,7 @@
 # apps/billing/serializers.py
 from rest_framework import serializers
 from django.utils import timezone
-from .models import Plan, Subscription, AuditLog, TrialUsage
+from .models import Plan, Subscription, AuditLog, TrialUsage, AutoRenewal
 from apps.payment.models import Payment
 import logging
 from .period_calculator import PeriodCalculator
@@ -91,11 +91,7 @@ class SubscriptionCreateSerializer(serializers.Serializer):
             logger.error(f"Subscription creation failed: Plan {plan_id} does not exist")
             raise serializers.ValidationError("Plan does not exist")
 
-        # Trial abuse prevention
-        has_previous_trial = TrialUsage.objects.filter(tenant_id=tenant_id, user_email=user.email).exists()
-        if has_previous_trial:
-            logger.warning(f"Trial abuse detected: Tenant {tenant_id} or user {user.email} already used trial")
-            raise serializers.ValidationError("Trial already used for this tenant or user")
+        # Trial abuse prevention (checked at service level with machine_number)
 
         data['tenant_id'] = tenant_id
         return data
@@ -103,6 +99,7 @@ class SubscriptionCreateSerializer(serializers.Serializer):
 
 class TrialActivationSerializer(serializers.Serializer):
     plan_id = serializers.UUIDField(required=False)
+    machine_number = serializers.CharField(max_length=255, required=False, allow_blank=True, allow_null=True, help_text="Optional machine identifier to prevent multiple trial usage from same machine")
 
     def validate(self, data):
         user = self.context['request'].user
@@ -133,11 +130,19 @@ class TrialActivationSerializer(serializers.Serializer):
                 logger.error(f"Trial activation failed: Plan {plan_id} does not exist")
                 raise serializers.ValidationError("Plan does not exist")
 
-        # Trial abuse prevention
-        has_previous_trial = TrialUsage.objects.filter(tenant_id=tenant_id, user_email=user.email).exists()
+        # Machine number trial abuse prevention
+        machine_number = data.get('machine_number')
+        if machine_number:
+            machine_trial_exists = TrialUsage.objects.filter(machine_number=machine_number).exists()
+            if machine_trial_exists:
+                logger.warning(f"Trial abuse detected: Machine {machine_number} already used for trial")
+                raise serializers.ValidationError("Trial already used from this machine")
+
+        # Tenant/user trial abuse prevention (additional check)
+        has_previous_trial = TrialUsage.objects.filter(tenant_id=tenant_id).exists()
         if has_previous_trial:
-            logger.warning(f"Trial abuse detected: Tenant {tenant_id} or user {user.email} already used trial")
-            raise serializers.ValidationError("Trial already used for this tenant or user")
+            logger.warning(f"Trial abuse detected: Tenant {tenant_id} already used trial")
+            raise serializers.ValidationError("Trial already used for this tenant")
 
         data['tenant_id'] = tenant_id
         return data
@@ -176,7 +181,7 @@ class SubscriptionSuspendSerializer(serializers.Serializer):
 
 class PlanChangeSerializer(serializers.Serializer):
     new_plan_id = serializers.UUIDField()
-    immediate = serializers.BooleanField(default=False)
+    immediate = serializers.BooleanField(default=True, read_only=True)  # Always immediate now
     reason = serializers.CharField(max_length=500, required=False)
 
     def validate(self, data):
@@ -241,3 +246,89 @@ class PaymentSerializer(serializers.ModelSerializer):
         fields = ['id', 'plan', 'subscription', 'amount', 'payment_date', 'transaction_id', 'status', 'provider',
                   'payment_type']
         read_only_fields = ['amount', 'payment_date', 'transaction_id', 'status', 'provider', 'payment_type']
+
+
+class AutoRenewalSerializer(serializers.ModelSerializer):
+    plan = PlanSerializer(read_only=True)
+    plan_id = serializers.UUIDField(write_only=True, required=False)
+    subscription_id = serializers.UUIDField(write_only=True, required=False)
+
+    class Meta:
+        model = AutoRenewal
+        fields = [
+            'id', 'tenant_id', 'user_id', 'subscription', 'subscription_id', 'plan', 'plan_id',
+            'expiry_date', 'status', 'created_at', 'updated_at', 'last_renewal_at',
+            'next_renewal_date', 'failure_count', 'max_failures', 'notes'
+        ]
+        read_only_fields = [
+            'id', 'created_at', 'updated_at', 'last_renewal_at', 'failure_count'
+        ]
+
+    def validate_plan_id(self, value):
+        if value:
+            try:
+                plan = Plan.objects.get(id=value)
+                if not plan.is_active or plan.discontinued:
+                    logger.warning(f"Auto-renewal creation failed: Plan {value} is not available")
+                    raise serializers.ValidationError("Plan is not available")
+                return value
+            except Plan.DoesNotExist:
+                logger.error(f"Auto-renewal creation failed: Plan {value} does not exist")
+                raise serializers.ValidationError("Plan does not exist")
+        return None
+
+
+class AutoRenewalCreateSerializer(serializers.Serializer):
+    plan_id = serializers.UUIDField()
+    expiry_date = serializers.DateTimeField()
+    subscription_id = serializers.UUIDField(required=False)
+
+    def validate(self, data):
+        user = self.context['request'].user
+        tenant_id = getattr(user, 'tenant', None)
+        if not tenant_id:
+            logger.warning(f"Auto-renewal creation failed: No tenant_id associated with user {user.email}")
+            raise serializers.ValidationError("No tenant associated with user")
+
+        # Validate plan
+        plan_id = data['plan_id']
+        try:
+            plan = Plan.objects.get(id=plan_id)
+            if not plan.is_active or plan.discontinued:
+                logger.warning(f"Auto-renewal creation failed: Plan {plan_id} is not available")
+                raise serializers.ValidationError("Plan is not available")
+        except Plan.DoesNotExist:
+            logger.error(f"Auto-renewal creation failed: Plan {plan_id} does not exist")
+            raise serializers.ValidationError("Plan does not exist")
+
+        # Validate subscription if provided
+        subscription_id = data.get('subscription_id')
+        if subscription_id:
+            try:
+                subscription = Subscription.objects.get(id=subscription_id)
+                if str(subscription.tenant_id) != str(tenant_id):
+                    raise serializers.ValidationError("Subscription does not belong to tenant")
+            except Subscription.DoesNotExist:
+                logger.error(f"Auto-renewal creation failed: Subscription {subscription_id} does not exist")
+                raise serializers.ValidationError("Subscription does not exist")
+
+        data['tenant_id'] = tenant_id
+        return data
+
+
+class AutoRenewalUpdateSerializer(serializers.Serializer):
+    plan_id = serializers.UUIDField(required=False)
+    status = serializers.ChoiceField(choices=AutoRenewal.STATUS_CHOICES, required=False)
+
+    def validate_plan_id(self, value):
+        if value:
+            try:
+                plan = Plan.objects.get(id=value)
+                if not plan.is_active or plan.discontinued:
+                    logger.warning(f"Auto-renewal update failed: Plan {value} is not available")
+                    raise serializers.ValidationError("Plan is not available")
+                return value
+            except Plan.DoesNotExist:
+                logger.error(f"Auto-renewal update failed: Plan {value} does not exist")
+                raise serializers.ValidationError("Plan does not exist")
+        return None
