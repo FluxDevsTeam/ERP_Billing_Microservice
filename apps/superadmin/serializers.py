@@ -5,9 +5,13 @@ class AnalyticsSerializer(serializers.Serializer):
     mrr = serializers.FloatField()
     churn_rate = serializers.FloatField()
     trial_conversion_rate = serializers.FloatField()
+    failed_payments_rate = serializers.FloatField()
     revenue_by_plan = serializers.ListField(child=serializers.DictField())
+    active_plans = serializers.ListField(child=serializers.DictField())
     total_subscriptions = serializers.IntegerField()
     active_subscriptions = serializers.IntegerField()
+    total_payments = serializers.IntegerField()
+    completed_payments = serializers.IntegerField()
     timestamp = serializers.CharField()
 
 class WebhookEventSerializer(serializers.ModelSerializer):

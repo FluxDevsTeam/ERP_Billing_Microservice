@@ -89,6 +89,9 @@ class Plan(models.Model):
 
     class Meta:
         unique_together = ("name", "industry")
+        indexes = [
+            models.Index(fields=['industry', 'is_active', 'discontinued']),
+        ]
 
     def clean(self):
         if self.max_users <= 0:
@@ -112,12 +115,12 @@ class Subscription(models.Model):
         ('trial', 'Trial'),
     )
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    tenant_id = models.UUIDField(unique=True, default=uuid.uuid4)
+    tenant_id = models.UUIDField(unique=True, default=uuid.uuid4, db_index=True)
     plan = models.ForeignKey(Plan, on_delete=models.CASCADE)
     scheduled_plan = models.ForeignKey(Plan, on_delete=models.SET_NULL, null=True, blank=True, related_name='scheduled_subscriptions')
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='trial')
-    start_date = models.DateTimeField(default=timezone.now)
-    end_date = models.DateTimeField()
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='trial', db_index=True)
+    start_date = models.DateTimeField(default=timezone.now, db_index=True)
+    end_date = models.DateTimeField(db_index=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     suspended_at = models.DateTimeField(null=True, blank=True)
@@ -130,6 +133,14 @@ class Subscription(models.Model):
     max_payment_retries = models.IntegerField(default=3)
     is_first_time_subscription = models.BooleanField(default=True)
     trial_used = models.BooleanField(default=False)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['tenant_id', 'status']),
+            models.Index(fields=['status', 'end_date']),
+            models.Index(fields=['tenant_id', 'end_date']),
+            models.Index(fields=['auto_renew', 'status']),
+        ]
 
     def calculate_end_date(self, start_date):
         """Calculate the end date based on the billing period"""
@@ -209,16 +220,16 @@ class AutoRenewal(models.Model):
     )
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    tenant_id = models.UUIDField(help_text="Tenant identifier for the subscription")
+    tenant_id = models.UUIDField(help_text="Tenant identifier for the subscription", db_index=True)
     user_id = models.CharField(max_length=255, null=True, blank=True, help_text="User identifier who set up the auto-renewal")
     subscription = models.ForeignKey(Subscription, on_delete=models.CASCADE, related_name='auto_renewals', null=True, blank=True, help_text="Optional reference to subscription")
     plan = models.ForeignKey(Plan, on_delete=models.SET_NULL, null=True, related_name='auto_renewals', help_text="Plan to renew to")
-    expiry_date = models.DateTimeField(help_text="Date when the current subscription period expires")
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='active')
+    expiry_date = models.DateTimeField(help_text="Date when the current subscription period expires", db_index=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='active', db_index=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     last_renewal_at = models.DateTimeField(null=True, blank=True, help_text="Last successful renewal timestamp")
-    next_renewal_date = models.DateTimeField(null=True, blank=True, help_text="Next scheduled renewal date")
+    next_renewal_date = models.DateTimeField(null=True, blank=True, help_text="Next scheduled renewal date", db_index=True)
     failure_count = models.IntegerField(default=0, help_text="Number of consecutive renewal failures")
     max_failures = models.IntegerField(default=3, help_text="Maximum allowed failures before auto-pause")
     notes = models.TextField(blank=True, help_text="Additional notes about the auto-renewal")
@@ -230,6 +241,7 @@ class AutoRenewal(models.Model):
             models.Index(fields=['tenant_id', 'status']),
             models.Index(fields=['expiry_date', 'status']),
             models.Index(fields=['status', 'next_renewal_date']),
+            models.Index(fields=['tenant_id', 'expiry_date']),
         ]
 
     def __str__(self):

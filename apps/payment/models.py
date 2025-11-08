@@ -16,15 +16,25 @@ class Payment(models.Model):
         ('pending', 'Pending'),
         ('completed', 'Completed'),
         ('failed', 'Failed'),
+        ('refunded', 'Refunded'),
     )
     plan = models.ForeignKey(Plan, on_delete=models.CASCADE, related_name='payments')
     subscription = models.ForeignKey(Subscription, on_delete=models.CASCADE, null=True, blank=True, related_name='payments')
     amount = models.DecimalField(max_digits=10, decimal_places=2)
     payment_date = models.DateTimeField(default=timezone.now)
-    transaction_id = models.CharField(max_length=128, unique=True)
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
+    transaction_id = models.CharField(max_length=128, unique=True, db_index=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending', db_index=True)
     provider = models.CharField(max_length=50)
     payment_type = models.CharField(max_length=20, choices=PAYMENT_TYPE_CHOICES, default='initial')
+    refund_reason = models.CharField(max_length=255, null=True, blank=True)
+    refunded_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['transaction_id', 'status']),
+            models.Index(fields=['payment_date', 'status']),
+            models.Index(fields=['subscription', 'status']),
+        ]
 
     def __str__(self):
         return f"Payment {self.transaction_id} for Plan {self.plan.id}"
@@ -46,6 +56,12 @@ class WebhookEvent(models.Model):
     last_retry_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     error_message = models.TextField(null=True, blank=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['provider', 'status']),
+            models.Index(fields=['created_at', 'status']),
+        ]
 
     def __str__(self):
         return f"Webhook {self.id} - {self.provider} - {self.status}"
