@@ -3,16 +3,19 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from django.utils import timezone
-from django.db.models import Sum, Count, F
-from django.db.models.functions import TruncMonth
-from apps.billing.models import Subscription, AuditLog
+from django.db.models import Sum, Count, F, Q
+from django.db.models.functions import TruncMonth, TruncDay
+from apps.billing.models import Subscription, AuditLog, Plan
 from apps.payment.models import Payment, WebhookEvent
 from apps.payment.services import PaymentService
-from apps.billing.serializers import SubscriptionSerializer, AuditLogSerializer
+from apps.billing.serializers import SubscriptionSerializer, AuditLogSerializer, PlanSerializer
 from .serializers import AnalyticsSerializer, WebhookEventSerializer
 from datetime import datetime, timedelta
 from .permissions import IsSuperuser
 from .utils import swagger_helper
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class SuperadminPortalViewSet(viewsets.ViewSet):
@@ -34,8 +37,7 @@ class SuperadminPortalViewSet(viewsets.ViewSet):
             # Monthly Recurring Revenue (MRR)
             active_subscriptions = Subscription.objects.filter(
                 status='active',
-                start_date__lte=end_date,
-                end_date__gte=start_date
+                end_date__gte=timezone.now()
             ).select_related('plan')
 
             # Calculate MRR based on billing_period
@@ -52,44 +54,67 @@ class SuperadminPortalViewSet(viewsets.ViewSet):
                 elif plan.billing_period == 'annual':
                     mrr += price / 12  # Convert annual price to monthly
 
-            # Churn Rate
+            # Churn Rate (canceled in period / total active at start of period)
+            initial_active = Subscription.objects.filter(
+                status='active',
+                start_date__lte=start_date
+            ).count()
             canceled_subscriptions = Subscription.objects.filter(
                 status='canceled',
                 canceled_at__range=(start_date, end_date)
             ).count()
-            total_subscriptions = Subscription.objects.filter(
-                start_date__lte=end_date
-            ).count()
-            churn_rate = (canceled_subscriptions / total_subscriptions * 100) if total_subscriptions else 0
+            churn_rate = (canceled_subscriptions / initial_active * 100) if initial_active else 0
 
             # Trial Conversion Rate
-            trials = Subscription.objects.filter(
+            trials_started = Subscription.objects.filter(
                 status='trial',
-                trial_end_date__range=(start_date, end_date)
+                start_date__range=(start_date, end_date)
             ).count()
-            converted_trials = Subscription.objects.filter(
+            trials_converted = Subscription.objects.filter(
                 status='active',
                 is_first_time_subscription=False,
-                last_payment_date__range=(start_date, end_date)
+                start_date__range=(start_date - timedelta(days=7), end_date)  # Allow 7-day conversion window
             ).count()
-            trial_conversion_rate = (converted_trials / trials * 100) if trials else 0
+            trial_conversion_rate = (trials_converted / trials_started * 100) if trials_started else 0
 
-            # Revenue by Plan
+            # Revenue by Plan (completed payments in period)
             revenue_by_plan = Payment.objects.filter(
                 payment_date__range=(start_date, end_date),
                 status='completed'
             ).values('plan__name').annotate(
                 total_amount=Sum('amount'),
                 count=Count('id')
-            )
+            ).order_by('-total_amount')
+
+            # Failed Payments Rate
+            total_payments = Payment.objects.filter(
+                payment_date__range=(start_date, end_date)
+            ).count()
+            failed_payments = Payment.objects.filter(
+                payment_date__range=(start_date, end_date),
+                status='failed'
+            ).count()
+            failed_rate = (failed_payments / total_payments * 100) if total_payments else 0
+
+            # Active Plans Overview
+            active_plans = Plan.objects.filter(
+                is_active=True,
+                discontinued=False
+            ).annotate(
+                subscription_count=Count('subscription', filter=Q(subscription__status='active'))
+            ).values('name', 'price', 'subscription_count')
 
             analytics_data = {
                 'mrr': float(mrr),
                 'churn_rate': float(churn_rate),
                 'trial_conversion_rate': float(trial_conversion_rate),
+                'failed_payments_rate': float(failed_rate),
                 'revenue_by_plan': list(revenue_by_plan),
-                'total_subscriptions': total_subscriptions,
+                'active_plans': list(active_plans),
+                'total_subscriptions': Subscription.objects.count(),
                 'active_subscriptions': active_subscriptions.count(),
+                'total_payments': total_payments,
+                'completed_payments': Payment.objects.filter(status='completed').count(),
                 'timestamp': timezone.now().isoformat()
             }
 
@@ -99,6 +124,7 @@ class SuperadminPortalViewSet(viewsets.ViewSet):
             return Response(serializer.data)
 
         except Exception as e:
+            logger.error(f"Analytics generation failed: {str(e)}")
             return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @swagger_helper(tags=['Superadmin Portal'], model='Subscription')
@@ -138,6 +164,35 @@ class SuperadminPortalViewSet(viewsets.ViewSet):
 
             return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+    @swagger_helper(tags=['Superadmin Portal'], model='Audit Log')
+    @action(detail=False, methods=['get'], url_path='audit-logs')
+    def list_audit_logs(self, request):
+        try:
+            action_filter = request.query_params.get('action')
+            start_date = request.query_params.get('start_date')
+            end_date = request.query_params.get('end_date')
+
+            queryset = AuditLog.objects.select_related('subscription__plan').all().order_by('-timestamp')
+
+            if action_filter:
+                queryset = queryset.filter(action=action_filter)
+            if start_date and end_date:
+                start_date = timezone.datetime.fromisoformat(start_date)
+                end_date = timezone.datetime.fromisoformat(end_date)
+                queryset = queryset.filter(timestamp__range=(start_date, end_date))
+
+            audit_logs = queryset[:200]  # Limit to 200 most recent
+            serializer = AuditLogSerializer(audit_logs, many=True)
+
+            return Response({
+                'count': audit_logs.count(),
+                'total_filtered': queryset.count(),
+                'results': serializer.data
+            })
+
+        except Exception as e:
+            return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
     @swagger_helper(tags=['Superadmin Portal'], model='Webhook Event')
     @action(detail=True, methods=['post'], url_path='retry-webhook')
     def retry_webhook(self, request, pk=None):
@@ -155,14 +210,31 @@ class SuperadminPortalViewSet(viewsets.ViewSet):
     @action(detail=False, methods=['get'], url_path='webhook-events')
     def list_webhook_events(self, request):
         try:
-            webhook_events = WebhookEvent.objects.all().order_by('-created_at')[:100]
+            status_filter = request.query_params.get('status')
+            provider_filter = request.query_params.get('provider')
+            start_date = request.query_params.get('start_date')
+            end_date = request.query_params.get('end_date')
+
+            queryset = WebhookEvent.objects.all().order_by('-created_at')
+
+            if status_filter:
+                queryset = queryset.filter(status=status_filter)
+            if provider_filter:
+                queryset = queryset.filter(provider=provider_filter)
+            if start_date and end_date:
+                start_date = timezone.datetime.fromisoformat(start_date)
+                end_date = timezone.datetime.fromisoformat(end_date)
+                queryset = queryset.filter(created_at__range=(start_date, end_date))
+
+            webhook_events = queryset[:100]
             serializer = WebhookEventSerializer(webhook_events, many=True)
 
             return Response({
                 'count': webhook_events.count(),
+                'total_filtered': queryset.count(),
                 'results': serializer.data
             })
 
         except Exception as e:
-
+            logger.error(f"Webhook events listing failed: {str(e)}")
             return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)

@@ -1,5 +1,6 @@
 import uuid
 import requests
+from rest_framework import status
 from rest_framework.response import Response
 from django.conf import settings
 
@@ -42,17 +43,18 @@ def initiate_flutterwave_payment(confirm_token, amount, user, plan_id, tenant_id
 
         payment_link = response_data.get("data", {}).get("link")
         if not payment_link:
-            return Response({"error": "Payment processing error. Please try again."}, status=502)
+            return Response({"error": "Payment processing error. Please try again."}, status=status.HTTP_502_BAD_GATEWAY)
         return Response({
             "message": "Flutterwave payment initiated successfully.",
             "payment_link": payment_link,
-            "tx_ref": reference
-        }, status=200)
+            "tx_ref": reference,
+            "authorization_url": payment_link
+        }, status=status.HTTP_200_OK)
 
-    except requests.exceptions.RequestException as err:
-        return Response({"error": "Payment service unavailable. Please try again later."}, status=503)
-    except Exception as e:
-        return Response({"error": "Payment processing failed. Please try again."}, status=500)
+    except requests.exceptions.RequestException:
+        return Response({"error": "Payment service unavailable. Please try again later."}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+    except Exception:
+        return Response({"error": "Payment processing failed. Please try again."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 def initiate_paystack_payment(confirm_token, amount, user, plan_id, tenant_id, tenant_name=None):
@@ -88,14 +90,15 @@ def initiate_paystack_payment(confirm_token, amount, user, plan_id, tenant_id, t
 
         payment_link = response_data.get("data", {}).get("authorization_url")
         if not payment_link:
-            return Response({"error": "Payment processing error. Please try again."}, status=502)
+            return Response({"error": "Payment processing error. Please try again."}, status=status.HTTP_502_BAD_GATEWAY)
         return Response({
             "message": "Paystack payment initiated successfully.",
             "payment_link": payment_link,
-            "tx_ref": reference
-        }, status=200)
+            "tx_ref": reference,
+            "authorization_url": payment_link
+        }, status=status.HTTP_200_OK)
 
-    except requests.exceptions.RequestException as err:
-        return Response({"error": "Payment service unavailable. Please try again later."}, status=503)
-    except Exception as e:
-        return Response({"error": "Payment processing failed. Please try again."}, status=500)
+    except requests.exceptions.RequestException:
+        return Response({"error": "Payment service unavailable. Please try again later."}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+    except Exception:
+        return Response({"error": "Payment processing failed. Please try again."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)

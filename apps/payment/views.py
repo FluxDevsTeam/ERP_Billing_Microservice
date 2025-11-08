@@ -24,6 +24,7 @@ import uuid
 from django.utils import timezone
 from .services import PaymentService
 from api.email_service import send_email_via_service
+from apps.billing.services import SubscriptionService
 from ..billing.period_calculator import PeriodCalculator
 
 
@@ -174,7 +175,7 @@ class PaymentInitiateViewSet(viewsets.ModelViewSet):
             plan = serializer.validated_data['plan_id']
 
             if plan.discontinued:
-                return Response({"error", "plan is discontinued"}, status=status.HTTP_423_LOCKED)
+                return Response({"error": "plan is discontinued"}, status=status.HTTP_423_LOCKED)
 
             provider = serializer.validated_data['provider']
             amount = plan.price
@@ -350,37 +351,18 @@ class PaymentVerifyViewSet(viewsets.ViewSet):
             payment.transaction_id = flutterwave_transaction_id if provider == "flutterwave" else transaction_id
             payment.save()
 
-            # Create or update subscription for tenant
+            # Create or update subscription using SubscriptionService for consistency
+            subscription_service = SubscriptionService(request)
             try:
                 tenant_uuid = uuid.UUID(tenant_id_param)
-            except Exception:
-                return redirect(f"{settings.FRONTEND_PATH}/payment-failed/?data=Invalid-tenant")
-
-            current_time = timezone.now()
-            subscription, created = Subscription.objects.get_or_create(
-                tenant_id=tenant_uuid,
-                defaults={
-                    'plan': plan,
-                    'status': 'active',
-                    'start_date': current_time,
-                }
-            )
-
-            if not created:
-                # For existing subscriptions
-                if subscription.plan != plan:
-                    subscription.plan = plan
-                subscription.status = 'active'
-                # If current subscription is still active, start from its end date
-                if subscription.end_date and subscription.end_date > current_time:
-                    subscription.start_date = subscription.end_date + timezone.timedelta(days=1)
-                else:
-                    # If expired, start fresh from current time
-                    subscription.start_date = current_time
-
-            # Let the model calculate the end_date based on the billing period
-            subscription.end_date = None
-            subscription.save()
+                subscription, result = subscription_service.create_subscription(
+                    tenant_id=str(tenant_uuid),
+                    plan_id=str(plan.id),
+                    user=str(user.id) if user else 'system',
+                    is_trial=False
+                )
+            except Exception as sub_e:
+                return redirect(f"{settings.FRONTEND_PATH}/payment-failed/?data=Subscription-creation-failed")
 
             # Send payment success email
             if user and user.email:
@@ -534,36 +516,18 @@ class PaymentWebhookViewSet(viewsets.ViewSet):
                 payment.transaction_id = flutterwave_transaction_id if provider == "flutterwave" else transaction_id
                 payment.save()
 
+            # Create or update subscription using SubscriptionService for consistency
+            subscription_service = SubscriptionService(request)
             try:
                 tenant_uuid = uuid.UUID(tenant_id_param)
-            except Exception:
-                return Response({"error": "Invalid tenant id"}, status=400)
-
-            current_time = timezone.now()
-            subscription, created = Subscription.objects.get_or_create(
-                tenant_id=tenant_uuid,
-                defaults={
-                    'plan': plan,
-                    'status': 'active',
-                    'start_date': current_time,
-                }
-            )
-
-            if not created:
-                # For existing subscriptions
-                if subscription.plan != plan:
-                    subscription.plan = plan
-                subscription.status = 'active'
-                # If current subscription is still active, start from its end date
-                if subscription.end_date and subscription.end_date > current_time:
-                    subscription.start_date = subscription.end_date + timezone.timedelta(days=1)
-                else:
-                    # If expired, start fresh from current time
-                    subscription.start_date = current_time
-
-            # Let the model calculate the end_date based on the billing period
-            subscription.end_date = None  # Trigger recalculation
-            subscription.save()
+                subscription, result = subscription_service.create_subscription(
+                    tenant_id=str(tenant_uuid),
+                    plan_id=str(plan.id),
+                    user=email,
+                    is_trial=False
+                )
+            except Exception as sub_e:
+                return Response({"error": "Subscription creation failed"}, status=500)
 
             # Send payment success email
             email_data = {
