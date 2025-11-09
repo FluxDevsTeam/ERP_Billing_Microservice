@@ -5,6 +5,7 @@ from django.core.cache import cache
 from django.conf import settings
 import uuid
 import logging
+import requests
 from typing import Optional, Dict, Any, Tuple
 from decimal import Decimal
 
@@ -212,13 +213,16 @@ class SubscriptionService:
             subscription.payment_retry_count = 0
             subscription.save()
 
-            # Update auto-renewal if it exists
+            # Update or create auto-renewal to maintain consistency
             try:
+                # First, try to find auto-renewal by subscription
                 auto_renewal = AutoRenewal.objects.filter(
                     subscription=subscription,
                     status='active'
                 ).first()
+                
                 if auto_renewal:
+                    # Update existing auto-renewal
                     auto_renewal.expiry_date = subscription.end_date
                     auto_renewal.next_renewal_date = self._calculate_next_renewal_date_for_auto_renewal(
                         subscription.end_date,
@@ -226,8 +230,29 @@ class SubscriptionService:
                     )
                     auto_renewal.last_renewal_at = timezone.now()
                     auto_renewal.save()
+                    logger.info(f"Updated auto-renewal {auto_renewal.id} for subscription {subscription_id}")
+                else:
+                    # Check if there's a tenant-based auto-renewal (no subscription reference)
+                    auto_renewal = AutoRenewal.objects.filter(
+                        tenant_id=subscription.tenant_id,
+                        status='active'
+                    ).first()
+                    
+                    if auto_renewal:
+                        # Link the auto-renewal to the renewed subscription
+                        auto_renewal.subscription = subscription
+                        auto_renewal.expiry_date = subscription.end_date
+                        auto_renewal.next_renewal_date = self._calculate_next_renewal_date_for_auto_renewal(
+                            subscription.end_date,
+                            auto_renewal.plan.billing_period
+                        )
+                        auto_renewal.last_renewal_at = timezone.now()
+                        auto_renewal.save()
+                        logger.info(f"Linked auto-renewal {auto_renewal.id} to renewed subscription {subscription_id}")
+                        
             except Exception as e:
-                logger.warning(f"Failed to update auto-renewal after subscription renewal: {str(e)}")
+                logger.error(f"Failed to update auto-renewal after subscription renewal: {str(e)}")
+                # Don't fail the entire renewal if auto-renewal update fails
 
             self._audit_log(subscription, 'renewed', user, {
                 'new_end_date': subscription.end_date.isoformat(),
@@ -235,11 +260,17 @@ class SubscriptionService:
                 'billing_period': subscription.plan.billing_period
             })
 
-            return subscription, {'status': 'success', 'new_end_date': subscription.end_date.isoformat()}
+            logger.info(f"Subscription {subscription_id} renewed successfully with plan {subscription.plan.name}")
+            return subscription, {
+                'status': 'success',
+                'new_end_date': subscription.end_date.isoformat(),
+                'auto_renewal_updated': True
+            }
 
         except Subscription.DoesNotExist:
             raise ValidationError("Subscription not found")
         except Exception as e:
+            logger.error(f"Subscription renewal failed for {subscription_id}: {str(e)}")
             raise ValidationError(f"Subscription renewal failed: {str(e)}")
 
     @transaction.atomic
@@ -247,6 +278,7 @@ class SubscriptionService:
         """
         Toggle auto-renewal on/off. This does NOT cancel the subscription.
         Only enables/disables automatic renewal. Subscription status remains unchanged.
+        Also removes/creates auto-renew from payment provider when disabling/enabling.
         """
         try:
             subscription = Subscription.objects.get(id=subscription_id)
@@ -256,6 +288,66 @@ class SubscriptionService:
                 raise ValidationError("Cannot toggle auto-renew for canceled or suspended subscription")
 
             subscription.auto_renew = auto_renew
+            subscription.save()
+
+            # Update AutoRenewal model for consistency
+            try:
+                auto_renewal = AutoRenewal.objects.filter(
+                    tenant_id=subscription.tenant_id,
+                    status='active'
+                ).first()
+
+                if auto_renew:
+                    # If enabling auto-renew, ensure AutoRenewal record exists
+                    if not auto_renewal:
+                        auto_renewal = AutoRenewal.objects.create(
+                            tenant_id=subscription.tenant_id,
+                            subscription=subscription,
+                            plan=subscription.plan,
+                            expiry_date=subscription.end_date,
+                            next_renewal_date=self._calculate_next_renewal_date_for_auto_renewal(
+                                subscription.end_date,
+                                subscription.plan.billing_period
+                            ),
+                            status='active',
+                            user_id=user
+                        )
+                        logger.info(f"Created AutoRenewal record for tenant {subscription.tenant_id}")
+                    else:
+                        # Update existing auto-renewal
+                        auto_renewal.subscription = subscription
+                        auto_renewal.plan = subscription.plan
+                        auto_renewal.expiry_date = subscription.end_date
+                        auto_renewal.next_renewal_date = self._calculate_next_renewal_date_for_auto_renewal(
+                            subscription.end_date,
+                            subscription.plan.billing_period
+                        )
+                        auto_renewal.user_id = user or auto_renewal.user_id
+                        auto_renewal.status = 'active'  # Reactivate if it was paused
+                        auto_renewal.save()
+                        logger.info(f"Updated AutoRenewal record for tenant {subscription.tenant_id}")
+
+                    # Create subscription authorization in payment provider (if supported)
+                    payment_provider_result = self._create_payment_provider_subscription(subscription, user)
+                    
+                    # Store payment provider identifiers in AutoRenewal notes
+                    if payment_provider_result.get('status') == 'success':
+                        self._store_payment_provider_info(auto_renewal, payment_provider_result)
+                    
+                    logger.info(f"Payment provider auto-renew setup: {payment_provider_result.get('status', 'unknown')}")
+                else:
+                    # If disabling auto-renew, cancel AutoRenewal record and payment provider subscription
+                    if auto_renewal:
+                        auto_renewal.status = 'canceled'
+                        auto_renewal.save()
+                        logger.info(f"Canceled AutoRenewal record for tenant {subscription.tenant_id}")
+
+                    # Cancel subscription authorization in payment provider
+                    payment_provider_result = self._cancel_payment_provider_subscription(subscription, user)
+                    logger.info(f"Payment provider auto-renew cancellation: {payment_provider_result.get('status', 'unknown')}")
+            except Exception as e:
+                logger.error(f"Failed to update AutoRenewal records: {str(e)}")
+                # Don't fail the entire operation if auto-renewal model update fails
 
             self._audit_log(subscription, 'auto_renew_toggled', user, {
                 'auto_renew': auto_renew,
@@ -263,7 +355,12 @@ class SubscriptionService:
                 'tenant_id': str(subscription.tenant_id),
                 'note': 'Auto-renew toggled without affecting subscription status'
             })
-            return subscription, {'status': 'success', 'auto_renew': auto_renew}
+
+            return subscription, {
+                'status': 'success', 
+                'auto_renew': auto_renew,
+                'auto_renewal_updated': True
+            }
 
         except Subscription.DoesNotExist:
             raise ValidationError("Subscription not found")
@@ -768,6 +865,1255 @@ class SubscriptionService:
             return self.request.META.get('REMOTE_ADDR')
         return None
 
+    def _create_payment_provider_subscription(self, subscription: Subscription, user: str = None) -> Dict[str, Any]:
+        """
+        Create recurring billing subscription in payment provider (Flutterwave/Paystack).
+        This enables automatic card billing for future renewals.
+        """
+        try:
+            # Get user email for billing
+            user_email = self.request.user.email if self.request and self.request.user else None
+            if not user_email:
+                return {'status': 'skipped', 'reason': 'No user email available'}
+
+            # Get payment provider from last successful payment or default to first configured
+            last_payment = subscription.payments.filter(status='completed').order_by('-payment_date').first()
+            provider = last_payment.provider if last_payment else list(settings.PAYMENT_PROVIDERS.keys())[0]
+            
+            # Build plan details for payment provider
+            plan_data = {
+                'plan_name': f"{subscription.plan.name} - {subscription.tenant_id}",
+                'amount': float(subscription.plan.price),
+                'interval': subscription.plan.billing_period,  # monthly, quarterly, etc.
+                'currency': settings.PAYMENT_CURRENCY,
+                'customer_email': user_email,
+                'tenant_id': str(subscription.tenant_id),
+                'subscription_id': str(subscription.id)
+            }
+
+            if provider == 'flutterwave':
+                return self._create_flutterwave_subscription(plan_data, subscription)
+            elif provider == 'paystack':
+                return self._create_paystack_subscription(plan_data, subscription)
+            else:
+                logger.warning(f"Unsupported payment provider for auto-renew: {provider}")
+                return {'status': 'skipped', 'reason': f'Unsupported provider: {provider}'}
+
+        except Exception as e:
+            logger.error(f"Failed to create payment provider subscription: {str(e)}")
+            return {'status': 'error', 'message': str(e)}
+
+    def _cancel_payment_provider_subscription(self, subscription: Subscription, user: str = None) -> Dict[str, Any]:
+        """
+        Cancel recurring billing subscription in payment provider.
+        This removes automatic card billing for future renewals.
+        """
+        try:
+            # Get payment provider from last successful payment
+            last_payment = subscription.payments.filter(status='completed').order_by('-payment_date').first()
+            if not last_payment:
+                return {'status': 'skipped', 'reason': 'No previous payment found'}
+
+            provider = last_payment.provider
+            user_email = self.request.user.email if self.request and self.request.user else None
+
+            plan_data = {
+                'customer_email': user_email,
+                'tenant_id': str(subscription.tenant_id),
+                'subscription_id': str(subscription.id),
+                'previous_transaction_id': last_payment.transaction_id
+            }
+
+            if provider == 'flutterwave':
+                return self._cancel_flutterwave_subscription(plan_data, subscription)
+            elif provider == 'paystack':
+                return self._cancel_paystack_subscription(plan_data, subscription)
+            else:
+                logger.warning(f"Unsupported payment provider for cancellation: {provider}")
+                return {'status': 'skipped', 'reason': f'Unsupported provider: {provider}'}
+
+        except Exception as e:
+            logger.error(f"Failed to cancel payment provider subscription: {str(e)}")
+            return {'status': 'error', 'message': str(e)}
+
+    def _create_flutterwave_subscription(self, plan_data: Dict, subscription: Subscription) -> Dict[str, Any]:
+        """Create recurring billing in Flutterwave using Payment Plans"""
+        try:
+            import requests
+            
+            flutterwave_key = settings.PAYMENT_PROVIDERS["flutterwave"]["secret_key"]
+            
+            # Step 1: Create payment plan
+            plan_result = self._create_flutterwave_payment_plan(plan_data)
+            if not plan_result['success']:
+                return plan_result
+                
+            plan_id = plan_result['plan_id']
+            plan_token = plan_result['plan_token']
+            
+            # Step 2: Get the authorization code from previous payment
+            last_payment = subscription.payments.filter(
+                status='completed', 
+                provider='flutterwave'
+            ).order_by('-payment_date').first()
+            
+            if not last_payment:
+                return {
+                    'status': 'skipped', 
+                    'reason': 'No Flutterwave payment found - customer must make a payment first'
+                }
+            
+            # Step 3: The subscription is created when we charge the customer with the plan_id
+            # Since this is for auto-renewal, we assume the customer already has a valid payment method
+            # We just return the plan information for future use
+            logger.info(f"Flutterwave payment plan ready for tenant {plan_data['tenant_id']}: {plan_token}")
+            return {
+                'status': 'success',
+                'plan_id': plan_id,
+                'plan_token': plan_token,
+                'message': 'Payment plan created - will be activated on next charge',
+                'provider': 'flutterwave'
+            }
+
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Flutterwave API error: {str(e)}")
+            return {'status': 'error', 'message': 'Flutterwave service unavailable'}
+        except Exception as e:
+            logger.error(f"Flutterwave subscription creation error: {str(e)}")
+            return {'status': 'error', 'message': str(e)}
+
+    def _create_flutterwave_payment_plan(self, plan_data: Dict) -> Dict[str, Any]:
+        """Create a payment plan in Flutterwave"""
+        try:
+            import requests
+            
+            flutterwave_key = settings.PAYMENT_PROVIDERS["flutterwave"]["secret_key"]
+            url = "https://api.flutterwave.com/v3/payment-plans"
+            headers = {
+                "Authorization": f"Bearer {flutterwave_key}",
+                "Content-Type": "application/json"
+            }
+            
+            # Map our interval to Flutterwave's format
+            interval_mapping = {
+                'monthly': 'monthly',
+                'quarterly': 'quarterly', 
+                'biannual': 'bi-annually',
+                'annual': 'yearly'
+            }
+            
+            flutterwave_interval = interval_mapping.get(plan_data['interval'], 'monthly')
+            
+            data = {
+                "name": plan_data['plan_name'],
+                "amount": int(plan_data['amount'] * 100),  # Convert to kobo (multiply by 100)
+                "interval": flutterwave_interval,
+                "duration": None,  # Indefinite billing
+                "currency": plan_data['currency']
+            }
+
+            response = requests.post(url, headers=headers, json=data, timeout=10)
+            response.raise_for_status()
+            response_data = response.json()
+
+            if response_data.get('status') == 'success':
+                plan_info = response_data['data']
+                plan_token = plan_info.get('plan_token')
+                logger.info(f"Flutterwave payment plan created: {plan_token}")
+                return {
+                    'success': True,
+                    'plan_id': plan_info.get('id'),
+                    'plan_token': plan_token,
+                    'name': plan_info.get('name')
+                }
+            else:
+                error_msg = response_data.get('message', 'Unknown error')
+                logger.error(f"Flutterwave payment plan creation failed: {error_msg}")
+                return {'success': False, 'error': error_msg}
+
+        except Exception as e:
+            logger.error(f"Flutterwave payment plan creation error: {str(e)}")
+            return {'success': False, 'error': str(e)}
+
+    def _create_paystack_subscription(self, plan_data: Dict, subscription: Subscription) -> Dict[str, Any]:
+        """Create recurring billing in Paystack using proper subscription API"""
+        try:
+            import requests
+            
+            paystack_key = settings.PAYMENT_PROVIDERS['paystack']['secret_key']
+            
+            # Step 1: Create or get Paystack plan
+            plan_result = self._get_or_create_paystack_plan(plan_data)
+            if not plan_result['success']:
+                return plan_result
+            
+            plan_code = plan_result['plan_code']
+            
+            # Step 2: Get customer code from last successful payment
+            last_payment = subscription.payments.filter(
+                status='completed', 
+                provider='paystack'
+            ).order_by('-payment_date').first()
+            
+            if not last_payment:
+                return {
+                    'status': 'skipped', 
+                    'reason': 'No Paystack authorization found - customer must make a payment first'
+                }
+            
+            # Step 3: Create subscription using Paystack Subscription API
+            # We need to get customer code and authorization code from the payment
+            customer_info = self._extract_paystack_customer_info(last_payment)
+            if not customer_info['customer_code']:
+                return {
+                    'status': 'skipped',
+                    'reason': 'Could not extract customer code from payment history'
+                }
+            
+            url = "https://api.paystack.co/subscription"
+            headers = {
+                "Authorization": f"Bearer {paystack_key}", 
+                "Content-Type": "application/json"
+            }
+            
+            data = {
+                "customer": customer_info['customer_code'],
+                "plan": plan_code,
+                "email_token": plan_data['customer_email']  # Used for webhook verification
+            }
+            
+            # Add authorization code if available
+            if customer_info.get('authorization_code'):
+                data["authorization"] = customer_info['authorization_code']
+
+            response = requests.post(url, headers=headers, json=data, timeout=10)
+            response.raise_for_status()
+            response_data = response.json()
+
+            if response_data.get('status') and response_data.get('data'):
+                subscription_data = response_data['data']
+                logger.info(f"Paystack subscription created for tenant {plan_data['tenant_id']}: {subscription_data.get('subscription_code')}")
+                return {
+                    'status': 'success',
+                    'subscription_code': subscription_data.get('subscription_code'),
+                    'authorization_code': subscription_data.get('authorization_code'),
+                    'customer_code': customer_info['customer_code'],
+                    'plan_code': plan_code,
+                    'next_payment_date': subscription_data.get('next_payment_date'),
+                    'provider': 'paystack'
+                }
+            else:
+                error_msg = response_data.get('message', 'Unknown error')
+                logger.error(f"Paystack subscription creation failed: {error_msg}")
+                return {'status': 'error', 'message': error_msg}
+
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Paystack API error: {str(e)}")
+            return {'status': 'error', 'message': 'Paystack service unavailable'}
+        except Exception as e:
+            logger.error(f"Paystack subscription creation error: {str(e)}")
+            return {'status': 'error', 'message': str(e)}
+
+    def _get_or_create_paystack_plan(self, plan_data: Dict) -> Dict[str, Any]:
+        """Get existing Paystack plan or create a new one"""
+        try:
+            import requests
+            
+            paystack_key = settings.PAYMENT_PROVIDERS['paystack']['secret_key']
+            plan_code = f"PLAN_{plan_data['tenant_id'][:8]}_{plan_data['interval']}"
+            
+            # Try to get existing plan first
+            url = f"https://api.paystack.co/plan/{plan_code}"
+            headers = {"Authorization": f"Bearer {paystack_key}"}
+            
+            try:
+                response = requests.get(url, headers=headers, timeout=10)
+                if response.status_code == 200:
+                    data = response.json()
+                    if data.get('status') and data.get('data'):
+                        logger.info(f"Found existing Paystack plan: {plan_code}")
+                        return {
+                            'success': True,
+                            'plan_code': plan_code,
+                            'plan_id': data['data'].get('id')
+                        }
+            except requests.exceptions.RequestException:
+                # Plan doesn't exist, we'll create it
+                pass
+
+            # Create new plan if doesn't exist
+            url = "https://api.paystack.co/plan"
+            headers = {
+                "Authorization": f"Bearer {paystack_key}",
+                "Content-Type": "application/json"
+            }
+            
+            # Map our interval to Paystack's interval format
+            interval_mapping = {
+                'monthly': 'monthly',
+                'quarterly': 'quarterly', 
+                'biannual': 'biannually',
+                'annual': 'annually'
+            }
+            
+            paystack_interval = interval_mapping.get(plan_data['interval'], 'monthly')
+            
+            data = {
+                "name": plan_data['plan_name'],
+                "interval": paystack_interval,
+                "amount": int(plan_data['amount'] * 100),  # Convert to kobo
+                "currency": plan_data['currency']
+            }
+
+            response = requests.post(url, headers=headers, json=data, timeout=10)
+            response.raise_for_status()
+            response_data = response.json()
+
+            if response_data.get('status') and response_data.get('data'):
+                plan_info = response_data['data']
+                logger.info(f"Created new Paystack plan: {plan_code} (ID: {plan_info.get('id')})")
+                return {
+                    'success': True,
+                    'plan_code': plan_code,
+                    'plan_id': plan_info.get('id'),
+                    'plan_token': plan_info.get('plan_token')
+                }
+            else:
+                error_msg = response_data.get('message', 'Unknown error')
+                logger.error(f"Paystack plan creation failed: {error_msg}")
+                return {'success': False, 'error': error_msg}
+
+        except Exception as e:
+            logger.error(f"Paystack plan creation error: {str(e)}")
+            return {'success': False, 'error': str(e)}
+
+    def _extract_paystack_customer_info(self, payment) -> Dict[str, Any]:
+        """Extract customer information from Paystack payment data"""
+        # Paystack doesn't return customer_code in standard payment verification
+        # You would need to either:
+        # 1. Store customer_code when payment is made
+        # 2. Use the email to look up customer
+        # 3. Use transaction reference to get full transaction details
+        
+        try:
+            import requests
+            
+            # Option 1: Try to get customer code using transaction reference
+            if payment.transaction_id:
+                paystack_key = settings.PAYMENT_PROVIDERS['paystack']['secret_key']
+                url = f"https://api.paystack.co/transaction/verify/{payment.transaction_id}"
+                headers = {"Authorization": f"Bearer {paystack_key}"}
+                
+                response = requests.get(url, headers=headers, timeout=10)
+                if response.status_code == 200:
+                    data = response.json()
+                    if data.get('status') and data.get('data'):
+                        transaction_data = data['data']
+                        customer = transaction_data.get('customer', {})
+                        
+                        return {
+                            'customer_code': customer.get('customer_code'),
+                            'authorization_code': transaction_data.get('authorization', {}).get('authorization_code'),
+                            'email': customer.get('email')
+                        }
+        except Exception as e:
+            logger.error(f"Failed to extract Paystack customer info: {str(e)}")
+        
+        # Fallback: return what we can infer
+        return {
+            'customer_code': None,  # Would need to be stored during payment
+            'authorization_code': None,  # Would need to be stored during payment  
+            'email': payment.subscription.tenant_id if payment.subscription else None
+        }
+
+    def _cancel_flutterwave_subscription(self, plan_data: Dict, subscription: Subscription) -> Dict[str, Any]:
+        """Cancel recurring billing in Flutterwave"""
+        try:
+            import requests
+            
+            flutterwave_key = settings.PAYMENT_PROVIDERS["flutterwave"]["secret_key"]
+            
+            # Get the plan token from our stored data
+            plan_token = self._get_flutterwave_plan_token(subscription)
+            if not plan_token:
+                return {
+                    'status': 'skipped',
+                    'reason': 'No Flutterwave plan token found'
+                }
+            
+            # Cancel the payment plan
+            url = f"https://api.flutterwave.com/v3/payment-plans/{plan_token}/cancel"
+            headers = {
+                "Authorization": f"Bearer {flutterwave_key}",
+                "Content-Type": "application/json"
+            }
+
+            response = requests.post(url, headers=headers, json={}, timeout=10)
+            response.raise_for_status()
+            response_data = response.json()
+
+            if response_data.get('status') == 'success':
+                logger.info(f"Flutterwave payment plan canceled for tenant {plan_data['tenant_id']}: {plan_token}")
+                return {
+                    'status': 'success',
+                    'plan_token': plan_token,
+                    'message': 'Auto-renew canceled (Flutterwave)',
+                    'provider': 'flutterwave'
+                }
+            else:
+                error_msg = response_data.get('message', 'Unknown error')
+                logger.error(f"Flutterwave subscription cancellation failed: {error_msg}")
+                return {'status': 'error', 'message': error_msg}
+
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Flutterwave API error: {str(e)}")
+            return {'status': 'error', 'message': 'Flutterwave service unavailable'}
+        except Exception as e:
+            logger.error(f"Flutterwave cancellation error: {str(e)}")
+            return {'status': 'error', 'message': str(e)}
+
+    def _cancel_paystack_subscription(self, plan_data: Dict, subscription: Subscription) -> Dict[str, Any]:
+        """Cancel recurring billing in Paystack using subscription_code"""
+        try:
+            import requests
+            
+            paystack_key = settings.PAYMENT_PROVIDERS['paystack']['secret_key']
+            
+            # Get subscription code from our stored data
+            # In a real implementation, you would store the subscription_code when creating the subscription
+            subscription_code = self._get_paystack_subscription_code(subscription)
+            if not subscription_code:
+                return {
+                    'status': 'skipped', 
+                    'reason': 'No Paystack subscription code found - subscription may not be active'
+                }
+            
+            url = "https://api.paystack.co/subscription/disable"
+            headers = {
+                "Authorization": f"Bearer {paystack_key}", 
+                "Content-Type": "application/json"
+            }
+            
+            # Paystack requires both code (subscription code) and token (email)
+            data = {
+                "code": subscription_code,
+                "token": plan_data['customer_email']
+            }
+
+            response = requests.post(url, headers=headers, json=data, timeout=10)
+            response.raise_for_status()
+            response_data = response.json()
+
+            if response_data.get('status'):
+                logger.info(f"Paystack subscription disabled for tenant {plan_data['tenant_id']}: {subscription_code}")
+                return {
+                    'status': 'success',
+                    'subscription_code': subscription_code,
+                    'message': 'Auto-renew canceled (Paystack)',
+                    'provider': 'paystack'
+                }
+            else:
+                error_msg = response_data.get('message', 'Unknown error')
+                logger.error(f"Paystack subscription cancellation failed: {error_msg}")
+                return {'status': 'error', 'message': error_msg}
+
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Paystack API error: {str(e)}")
+            return {'status': 'error', 'message': 'Paystack service unavailable'}
+        except Exception as e:
+            logger.error(f"Paystack subscription cancellation error: {str(e)}")
+            return {'status': 'error', 'message': str(e)}
+
+    def _get_paystack_subscription_code(self, subscription: Subscription) -> str:
+        """Get the Paystack subscription code for a subscription"""
+        auto_renewal = AutoRenewal.objects.filter(
+            subscription=subscription,
+            status__in=['active', 'canceled']
+        ).order_by('-created_at').first()
+        
+        if auto_renewal and auto_renewal.notes:
+            import re
+            match = re.search(r'paystack_subscription_code:([A-Za-z0-9_]+)', auto_renewal.notes)
+            if match:
+                return match.group(1)
+        
+        return None
+
+    def _get_flutterwave_plan_token(self, subscription: Subscription) -> str:
+        """Get the Flutterwave plan token for a subscription"""
+        auto_renewal = AutoRenewal.objects.filter(
+            subscription=subscription,
+            status__in=['active', 'canceled']
+        ).order_by('-created_at').first()
+        
+        if auto_renewal and auto_renewal.notes:
+            import re
+            match = re.search(r'flutterwave_plan_token:([A-Za-z0-9_]+)', auto_renewal.notes)
+            if match:
+                return match.group(1)
+        
+        return None
+
+    def change_subscription_card(self, subscription_id: str, new_payment_token: str, user: str = None) -> Dict[str, Any]:
+        """
+        Change the card used for auto-renewal subscription.
+        
+        Args:
+            subscription_id: The subscription ID
+            new_payment_token: Token from new payment (authorization code for Paystack, token for Flutterwave)
+            user: User performing the change
+        
+        Returns:
+            Dict with status and message
+        """
+        try:
+            subscription = Subscription.objects.get(id=subscription_id)
+            provider = 'paystack'  # Could be determined from payment history
+            
+            if provider == 'paystack':
+                return self._change_paystack_subscription_card(subscription, new_payment_token, user)
+            elif provider == 'flutterwave':
+                return self._change_flutterwave_subscription_card(subscription, new_payment_token, user)
+            else:
+                return {'status': 'error', 'message': 'Unsupported payment provider'}
+                
+        except Subscription.DoesNotExist:
+            return {'status': 'error', 'message': 'Subscription not found'}
+        except Exception as e:
+            logger.error(f"Card change failed: {str(e)}")
+            return {'status': 'error', 'message': str(e)}
+
+    def _change_paystack_subscription_card(self, subscription: Subscription, new_authorization_code: str, user: str = None) -> Dict[str, Any]:
+        """Change the authorization code for a Paystack subscription"""
+        try:
+            # Get the active auto-renewal
+            auto_renewal = AutoRenewal.objects.filter(
+                subscription=subscription,
+                status='active'
+            ).first()
+            
+            if not auto_renewal:
+                return {'status': 'error', 'message': 'No active auto-renewal found'}
+            
+            # Get subscription code from stored provider info
+            provider_info = self._extract_payment_provider_info(auto_renewal)
+            subscription_code = provider_info.get('subscription_code')
+            
+            if not subscription_code:
+                return {'status': 'error', 'message': 'No subscription code found - cannot update card'}
+            
+            # Paystack doesn't have a direct "update authorization" API
+            # So we need to create a new subscription with the new authorization
+            paystack_key = settings.PAYMENT_PROVIDERS['paystack']['secret_key']
+            url = "https://api.paystack.co/subscription"
+            headers = {"Authorization": f"Bearer {paystack_key}", "Content-Type": "application/json"}
+            
+            data = {
+                "customer": provider_info.get('customer_code'),
+                "plan": provider_info.get('plan_code'),
+                "authorization": new_authorization_code
+            }
+            
+            response = requests.post(url, headers=headers, json=data, timeout=10)
+            response.raise_for_status()
+            response_data = response.json()
+            
+            if response_data.get('status') and response_data.get('data'):
+                new_subscription_data = response_data['data']
+                
+                # Update auto-renewal with new subscription code
+                self._store_payment_provider_info(auto_renewal, {
+                    'subscription_code': new_subscription_data.get('subscription_code'),
+                    'authorization_code': new_authorization_code,
+                    'customer_code': provider_info.get('customer_code'),
+                    'plan_code': provider_info.get('plan_code')
+                })
+                
+                # Cancel the old subscription
+                self._cancel_old_paystack_subscription(subscription_code, provider_info.get('customer_email', ''))
+                
+                logger.info(f"Paystack subscription card updated for subscription {subscription.id}")
+                return {
+                    'status': 'success',
+                    'message': 'Card updated successfully for auto-renewal',
+                    'new_subscription_code': new_subscription_data.get('subscription_code')
+                }
+            else:
+                error_msg = response_data.get('message', 'Unknown error')
+                return {'status': 'error', 'message': error_msg}
+                
+        except Exception as e:
+            logger.error(f"Paystack card change failed: {str(e)}")
+            return {'status': 'error', 'message': str(e)}
+
+    def _cancel_old_paystack_subscription(self, old_subscription_code: str, customer_email: str) -> None:
+        """Cancel the old Paystack subscription after creating a new one"""
+        try:
+            paystack_key = settings.PAYMENT_PROVIDERS['paystack']['secret_key']
+            url = "https://api.paystack.co/subscription/disable"
+            headers = {"Authorization": f"Bearer {paystack_key}", "Content-Type": "application/json"}
+            
+            data = {
+                "code": old_subscription_code,
+                "token": customer_email
+            }
+            
+            response = requests.post(url, headers=headers, json=data, timeout=10)
+            if response.status_code == 200:
+                response_data = response.json()
+                if response_data.get('status'):
+                    logger.info(f"Old Paystack subscription canceled: {old_subscription_code}")
+                else:
+                    logger.warning(f"Failed to cancel old Paystack subscription: {response_data.get('message')}")
+            else:
+                logger.warning(f"Failed to cancel old Paystack subscription: HTTP {response.status_code}")
+                
+        except Exception as e:
+            logger.error(f"Error canceling old Paystack subscription: {str(e)}")
+
+    def _change_flutterwave_subscription_card(self, subscription: Subscription, new_payment_token: str, user: str = None) -> Dict[str, Any]:
+        """Change the card for a Flutterwave subscription"""
+        try:
+            # Flutterwave doesn't allow direct card changes for subscriptions
+            # The customer needs to make a new payment with the new card
+            # This will create a new payment plan subscription
+            
+            return {
+                'status': 'skipped',
+                'message': 'Flutterwave requires new payment to change card. Customer should make a new payment with the new card.',
+                'action_required': 'new_payment',
+                'instructions': [
+                    '1. Make a new payment with the desired card',
+                    '2. The new card will be automatically used for future auto-renewals',
+                    '3. The old subscription will be canceled'
+                ]
+            }
+            
+        except Exception as e:
+            logger.error(f"Flutterwave card change failed: {str(e)}")
+            return {'status': 'error', 'message': str(e)}
+
+    def manual_payment_with_saved_card(self, subscription_id: str, amount: Decimal = None, user: str = None) -> Dict[str, Any]:
+        """
+        Process a manual payment using saved card details (for early renewal or top-up).
+        
+        Args:
+            subscription_id: The subscription ID
+            amount: Amount to charge (defaults to plan price)
+            user: User making the payment
+        
+        Returns:
+            Dict with payment URL and details
+        """
+        try:
+            subscription = Subscription.objects.get(id=subscription_id)
+            charge_amount = amount or subscription.plan.price
+            
+            # Get the active auto-renewal and stored payment provider info
+            auto_renewal = AutoRenewal.objects.filter(
+                subscription=subscription,
+                status='active'
+            ).first()
+            
+            if not auto_renewal:
+                return {'status': 'error', 'message': 'No active auto-renewal found'}
+            
+            provider_info = self._extract_payment_provider_info(auto_renewal)
+            
+            if provider_info.get('provider') == 'paystack':
+                return self._paystack_manual_charge(subscription, charge_amount, provider_info, user)
+            elif provider_info.get('provider') == 'flutterwave':
+                return self._flutterwave_manual_charge(subscription, charge_amount, provider_info, user)
+            else:
+                return {'status': 'error', 'message': 'No saved payment method found'}
+                
+        except Subscription.DoesNotExist:
+            return {'status': 'error', 'message': 'Subscription not found'}
+        except Exception as e:
+            logger.error(f"Manual payment failed: {str(e)}")
+            return {'status': 'error', 'message': str(e)}
+
+    def manual_payment_with_new_card(self, subscription_id: str, amount: Decimal = None, provider: str = 'paystack', user: str = None) -> Dict[str, Any]:
+        """
+        Process a manual payment using new card details (for early renewal or top-up).
+        This creates a fresh payment flow where user enters new card details.
+        
+        Args:
+            subscription_id: The subscription ID
+            amount: Amount to charge (defaults to plan price)
+            provider: Payment provider ('paystack' or 'flutterwave')
+            user: User making the payment
+        
+        Returns:
+            Dict with payment initialization details
+        """
+        try:
+            subscription = Subscription.objects.get(id=subscription_id)
+            charge_amount = amount or subscription.plan.price
+            
+            # Get tenant information from subscription
+            tenant_id = str(subscription.tenant_id)
+            
+            # Get user email for payment
+            user_email = self.request.user.email if self.request and self.request.user else None
+            if not user_email:
+                return {'status': 'error', 'message': 'User email required for payment'}
+            
+            # Create payment record for tracking
+            from apps.payment.models import Payment
+            payment = Payment.objects.create(
+                plan=subscription.plan,
+                subscription=subscription,
+                amount=charge_amount,
+                transaction_id=str(uuid.uuid4()),
+                status='pending',
+                provider=provider,
+                payment_type='manual'
+            )
+            
+            # Initialize payment based on provider
+            if provider == 'paystack':
+                return self._initialize_paystack_payment(
+                    payment=payment,
+                    amount=charge_amount,
+                    user_email=user_email,
+                    tenant_id=tenant_id
+                )
+            elif provider == 'flutterwave':
+                return self._initialize_flutterwave_payment(
+                    payment=payment,
+                    amount=charge_amount,
+                    user_email=user_email,
+                    tenant_id=tenant_id
+                )
+            else:
+                payment.delete()  # Clean up
+                return {'status': 'error', 'message': f'Unsupported payment provider: {provider}'}
+                
+        except Subscription.DoesNotExist:
+            return {'status': 'error', 'message': 'Subscription not found'}
+        except Exception as e:
+            logger.error(f"Manual payment with new card failed: {str(e)}")
+            return {'status': 'error', 'message': str(e)}
+
+    def _initialize_paystack_payment(self, payment, amount: Decimal, user_email: str, tenant_id: str) -> Dict[str, Any]:
+        """Initialize a Paystack payment for manual payment with new card"""
+        try:
+            import requests
+            
+            paystack_key = settings.PAYMENT_PROVIDERS['paystack']['secret_key']
+            url = "https://api.paystack.co/transaction/initialize"
+            headers = {"Authorization": f"Bearer {paystack_key}", "Content-Type": "application/json"}
+            
+            # Generate unique reference
+            reference = f"MANUAL_{payment.id}_{int(timezone.now().timestamp())}"
+            
+            # Get base URL for callback
+            base_url = settings.BILLING_MICROSERVICE_URL
+            callback_url = f"{base_url}/api/v1/payment/payment-verify/confirm/?tx_ref={reference}&confirm_token={payment.transaction_id}&provider=paystack&amount={float(amount)}&plan_id={str(payment.plan.id)}&tenant_id={tenant_id}"
+            
+            data = {
+                "email": user_email,
+                "amount": int(float(amount) * 100),  # Convert to kobo
+                "currency": settings.PAYMENT_CURRENCY,
+                "reference": reference,
+                "callback_url": callback_url,
+                "metadata": {
+                    "payment_id": str(payment.id),
+                    "subscription_id": str(payment.subscription.id),
+                    "tenant_id": tenant_id,
+                    "payment_type": "manual_new_card"
+                }
+            }
+            
+            response = requests.post(url, headers=headers, json=data, timeout=10)
+            response.raise_for_status()
+            response_data = response.json()
+            
+            if response_data.get('status'):
+                # Update payment with reference
+                payment.transaction_id = reference
+                payment.save()
+                
+                return {
+                    'status': 'success',
+                    'payment_id': str(payment.id),
+                    'payment_url': response_data['data']['authorization_url'],
+                    'access_code': response_data['data']['access_code'],
+                    'reference': reference,
+                    'amount': str(amount),
+                    'provider': 'paystack',
+                    'message': 'Please complete payment with your new card details'
+                }
+            else:
+                error_msg = response_data.get('message', 'Payment initialization failed')
+                payment.delete()
+                return {'status': 'error', 'message': error_msg}
+                
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Paystack API error: {str(e)}")
+            payment.delete()
+            return {'status': 'error', 'message': 'Paystack service unavailable'}
+        except Exception as e:
+            logger.error(f"Paystack payment initialization error: {str(e)}")
+            payment.delete()
+            return {'status': 'error', 'message': str(e)}
+
+    def _initialize_flutterwave_payment(self, payment, amount: Decimal, user_email: str, tenant_id: str) -> Dict[str, Any]:
+        """Initialize a Flutterwave payment for manual payment with new card"""
+        try:
+            import requests
+            
+            flutterwave_key = settings.PAYMENT_PROVIDERS["flutterwave"]["secret_key"]
+            url = "https://api.flutterwave.com/v3/payments"
+            headers = {"Authorization": f"Bearer {flutterwave_key}"}
+            
+            # Generate unique reference
+            reference = f"MANUAL_{payment.id}_{int(timezone.now().timestamp())}"
+            
+            # Get base URL for callback
+            base_url = settings.BILLING_MICROSERVICE_URL
+            redirect_url = f"{base_url}/api/v1/payment/payment-verify/confirm/?tx_ref={reference}&confirm_token={payment.transaction_id}&provider=flutterwave&amount={float(amount)}&plan_id={str(payment.plan.id)}&tenant_id={tenant_id}"
+            
+            data = {
+                "tx_ref": reference,
+                "amount": str(amount),
+                "currency": settings.PAYMENT_CURRENCY,
+                "redirect_url": redirect_url,
+                "meta": {
+                    "payment_id": str(payment.id),
+                    "subscription_id": str(payment.subscription.id),
+                    "tenant_id": tenant_id,
+                    "payment_type": "manual_new_card"
+                },
+                "customer": {
+                    "email": user_email
+                },
+                "customizations": {
+                    "title": "ERP Manual Payment",
+                    "logo": "https://tse3.mm.bing.net/th/id/OIP._08Ei4c5bwrBSNNLsoWMhgHaHa?cb=12&rs=1&pid=ImgDetMain&o=7&rm=3"
+                },
+                "configurations": {
+                    "session_duration": 10,
+                    "max_retry_attempt": 5
+                }
+            }
+            
+            response = requests.post(url, headers=headers, json=data, timeout=10)
+            response.raise_for_status()
+            response_data = response.json()
+            
+            if response_data.get('status') == 'success':
+                # Update payment with reference
+                payment.transaction_id = reference
+                payment.save()
+                
+                return {
+                    'status': 'success',
+                    'payment_id': str(payment.id),
+                    'payment_url': response_data['data']['link'],
+                    'flw_ref': response_data['data']['flw_ref'],
+                    'reference': reference,
+                    'amount': str(amount),
+                    'provider': 'flutterwave',
+                    'message': 'Please complete payment with your new card details'
+                }
+            else:
+                error_msg = response_data.get('message', 'Payment initialization failed')
+                payment.delete()
+                return {'status': 'error', 'message': error_msg}
+                
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Flutterwave API error: {str(e)}")
+            payment.delete()
+            return {'status': 'error', 'message': 'Flutterwave service unavailable'}
+        except Exception as e:
+            logger.error(f"Flutterwave payment initialization error: {str(e)}")
+            payment.delete()
+            return {'status': 'error', 'message': str(e)}
+
+    def _paystack_manual_charge(self, subscription: Subscription, amount: Decimal, provider_info: Dict, user: str = None) -> Dict[str, Any]:
+        """Process manual charge using Paystack saved authorization - Using direct charge method like Node.js example"""
+        try:
+            # Get stored authorization code
+            authorization_code = provider_info.get('authorization_code')
+            customer_email = provider_info.get('customer_email', '')
+            
+            if not authorization_code:
+                return {
+                    'status': 'skipped', 
+                    'reason': 'No authorization code found - user must make new payment',
+                    'action_required': 'new_payment'
+                }
+            
+            # Use direct charge endpoint like in the Node.js example
+            paystack_key = settings.PAYMENT_PROVIDERS['paystack']['secret_key']
+            url = "https://api.paystack.co/transaction/charge_authorization"
+            headers = {
+                "Authorization": f"Bearer {paystack_key}", 
+                "Content-Type": "application/json"
+            }
+            
+            data = {
+                "email": customer_email,
+                "amount": int(float(amount) * 100),  # Convert to kobo
+                "authorization_code": authorization_code
+            }
+            
+            response = requests.post(url, headers=headers, json=data, timeout=10)
+            response.raise_for_status()
+            response_data = response.json()
+            
+            if response_data.get('status') and response_data.get('data'):
+                transaction_data = response_data['data']
+                
+                # Create Payment record for tracking
+                from apps.payment.models import Payment
+                payment = Payment.objects.create(
+                    plan=subscription.plan,
+                    subscription=subscription,
+                    amount=amount,
+                    transaction_id=transaction_data.get('reference', str(uuid.uuid4())),
+                    status='completed' if transaction_data.get('status') == 'success' else 'failed',
+                    provider='paystack',
+                    payment_type='manual'
+                )
+                
+                # If successful, extend subscription
+                if transaction_data.get('status') == 'success':
+                    # Extend subscription by one billing period
+                    new_end_date = subscription.end_date
+                    if subscription.plan.billing_period == 'monthly':
+                        from dateutil.relativedelta import relativedelta
+                        new_end_date = subscription.end_date + relativedelta(months=1)
+                    elif subscription.plan.billing_period == 'quarterly':
+                        new_end_date = subscription.end_date + relativedelta(months=3)
+                    elif subscription.plan.billing_period == 'biannual':
+                        new_end_date = subscription.end_date + relativedelta(months=6)
+                    elif subscription.plan.billing_period == 'annual':
+                        new_end_date = subscription.end_date + relativedelta(years=1)
+                    
+                    subscription.end_date = new_end_date
+                    subscription.status = 'active'
+                    subscription.save()
+                    
+                    logger.info(f"Paystack direct charge successful for subscription {subscription.id}")
+                    return {
+                        'status': 'success',
+                        'message': 'Payment successful and subscription extended',
+                        'payment_id': str(payment.id),
+                        'transaction_id': transaction_data.get('reference'),
+                        'amount': str(amount),
+                        'new_end_date': new_end_date.isoformat()
+                    }
+                else:
+                    return {
+                        'status': 'failed',
+                        'message': f"Payment failed: {transaction_data.get('gateway_response', 'Unknown error')}",
+                        'payment_id': str(payment.id)
+                    }
+            else:
+                error_msg = response_data.get('message', 'Payment initialization failed')
+                return {'status': 'error', 'message': error_msg}
+                
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Paystack API error: {str(e)}")
+            return {'status': 'error', 'message': 'Paystack service unavailable'}
+        except Exception as e:
+            logger.error(f"Paystack direct charge failed: {str(e)}")
+            return {'status': 'error', 'message': str(e)}
+
+    def _flutterwave_manual_charge(self, subscription: Subscription, amount: Decimal, provider_info: Dict, user: str = None) -> Dict[str, Any]:
+        """Process manual charge using Flutterwave saved payment plan"""
+        try:
+            # Flutterwave also requires the customer to complete payment flow
+            # We can initialize a transaction with the payment plan
+            
+            flutterwave_key = settings.PAYMENT_PROVIDERS["flutterwave"]["secret_key"]
+            url = "https://api.flutterwave.com/v3/payments"
+            headers = {"Authorization": f"Bearer {flutterwave_key}"}
+            
+            # Get customer email from subscription or request
+            customer_email = getattr(self.request.user, 'email', '') if self.request else ''
+            
+            data = {
+                "tx_ref": f"MANUAL_{subscription.id}_{int(timezone.now().timestamp())}",
+                "amount": str(amount),
+                "currency": settings.PAYMENT_CURRENCY,
+                "customer": {
+                    "email": customer_email
+                },
+                "customizations": {
+                    "title": "ERP Manual Payment"
+                }
+                # Note: Flutterwave doesn't support direct plan charging in initialize API
+                # Customer would need to select saved card in the payment modal
+            }
+            
+            response = requests.post(url, headers=headers, json=data, timeout=10)
+            response.raise_for_status()
+            response_data = response.json()
+            
+            if response_data.get('status') == 'success':
+                return {
+                    'status': 'success',
+                    'payment_url': response_data['data']['link'],
+                    'flw_ref': response_data['data']['flw_ref'],
+                    'message': 'Please complete payment using saved card'
+                }
+            else:
+                error_msg = response_data.get('message', 'Unknown error')
+                return {'status': 'error', 'message': error_msg}
+                
+        except Exception as e:
+            logger.error(f"Flutterwave manual charge failed: {str(e)}")
+            return {'status': 'error', 'message': str(e)}
+
+    def process_auto_renewal_payment(self, subscription: Subscription, auto_renewal: AutoRenewal) -> Dict[str, Any]:
+        """
+        Process auto-renewal payment using direct charge method (like Node.js example).
+        This is the simplified approach for auto-renewal.
+        """
+        try:
+            # Get payment provider info from auto-renewal
+            provider_info = self._extract_payment_provider_info(auto_renewal)
+            
+            if provider_info.get('provider') == 'paystack':
+                return self._paystack_direct_charge_for_renewal(subscription, auto_renewal, provider_info)
+            elif provider_info.get('provider') == 'flutterwave':
+                return self._flutterwave_renewal_payment(subscription, auto_renewal, provider_info)
+            else:
+                return {'status': 'error', 'message': 'No payment provider info found'}
+                
+        except Exception as e:
+            logger.error(f"Auto-renewal payment failed: {str(e)}")
+            return {'status': 'error', 'message': str(e)}
+
+    def _paystack_direct_charge_for_renewal(self, subscription: Subscription, auto_renewal: AutoRenewal, provider_info: Dict) -> Dict[str, Any]:
+        """Process Paystack auto-renewal using direct charge (Node.js method)"""
+        try:
+            # Get stored authorization code
+            authorization_code = provider_info.get('authorization_code')
+            customer_email = provider_info.get('customer_email', '')
+            
+            if not authorization_code:
+                return {
+                    'status': 'failed',
+                    'reason': 'No authorization code found',
+                    'action_required': 'user_action_required'
+                }
+            
+            # Use direct charge endpoint like in Node.js example
+            paystack_key = settings.PAYMENT_PROVIDERS['paystack']['secret_key']
+            url = "https://api.paystack.co/transaction/charge_authorization"
+            headers = {
+                "Authorization": f"Bearer {paystack_key}", 
+                "Content-Type": 'application/json'
+            }
+            
+            # Calculate amount (plan price)
+            amount = subscription.plan.price
+            
+            data = {
+                "email": customer_email,
+                "amount": int(float(amount) * 100),  # Convert to kobo
+                "authorization_code": authorization_code
+            }
+            
+            logger.info(f"Processing Paystack auto-renewal for subscription {subscription.id}")
+            logger.info(f"Using authorization code: {authorization_code}")
+            logger.info(f"Amount: {amount} ({int(float(amount) * 100)} kobo)")
+            
+            response = requests.post(url, headers=headers, json=data, timeout=10)
+            response.raise_for_status()
+            response_data = response.json()
+            
+            if response_data.get('status') and response_data.get('data'):
+                transaction_data = response_data['data']
+                
+                # Create Payment record
+                from apps.payment.models import Payment
+                payment = Payment.objects.create(
+                    plan=subscription.plan,
+                    subscription=subscription,
+                    amount=amount,
+                    transaction_id=transaction_data.get('reference', str(uuid.uuid4())),
+                    status='completed' if transaction_data.get('status') == 'success' else 'failed',
+                    provider='paystack',
+                    payment_type='renewal'
+                )
+                
+                if transaction_data.get('status') == 'success':
+                    # Extend subscription by one billing period
+                    self._extend_subscription_period(subscription)
+                    
+                    # Update auto-renewal for next cycle
+                    self._update_auto_renewal_for_next_cycle(auto_renewal, subscription)
+                    
+                    logger.info(f"Paystack auto-renewal successful for subscription {subscription.id}")
+                    return {
+                        'status': 'success',
+                        'message': 'Auto-renewal successful',
+                        'payment_id': str(payment.id),
+                        'transaction_id': transaction_data.get('reference'),
+                        'amount': str(amount),
+                        'new_end_date': subscription.end_date.isoformat(),
+                        'next_renewal_date': auto_renewal.next_renewal_date.isoformat() if auto_renewal.next_renewal_date else None
+                    }
+                else:
+                    # Payment failed
+                    auto_renewal.failure_count += 1
+                    if auto_renewal.failure_count >= auto_renewal.max_failures:
+                        auto_renewal.status = 'failed'
+                        logger.warning(f"Auto-renewal {auto_renewal.id} marked as failed after {auto_renewal.failure_count} attempts")
+                    auto_renewal.save()
+                    
+                    return {
+                        'status': 'failed',
+                        'message': f"Payment failed: {transaction_data.get('gateway_response', 'Unknown error')}",
+                        'payment_id': str(payment.id),
+                        'failure_count': auto_renewal.failure_count
+                    }
+            else:
+                error_msg = response_data.get('message', 'Auto-renewal payment failed')
+                logger.error(f"Paystack auto-renewal failed: {error_msg}")
+                return {'status': 'error', 'message': error_msg}
+                
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Paystack API error during auto-renewal: {str(e)}")
+            return {'status': 'error', 'message': 'Paystack service unavailable'}
+        except Exception as e:
+            logger.error(f"Paystack auto-renewal processing failed: {str(e)}")
+            return {'status': 'error', 'message': str(e)}
+
+    def _flutterwave_renewal_payment(self, subscription: Subscription, auto_renewal: AutoRenewal, provider_info: Dict) -> Dict[str, Any]:
+        """Process Flutterwave auto-renewal"""
+        try:
+            # Flutterwave doesn't have direct charge like Paystack
+            # For now, we'll mark as requiring user action
+            logger.info(f"Flutterwave auto-renewal requires user action for subscription {subscription.id}")
+            return {
+                'status': 'requires_action',
+                'message': 'Flutterwave requires user to complete payment manually',
+                'action_required': 'user_payment_required'
+            }
+        except Exception as e:
+            logger.error(f"Flutterwave auto-renewal failed: {str(e)}")
+            return {'status': 'error', 'message': str(e)}
+
+    def _extend_subscription_period(self, subscription: Subscription) -> None:
+        """Extend subscription by one billing period"""
+        from dateutil.relativedelta import relativedelta
+        
+        if subscription.plan.billing_period == 'monthly':
+            subscription.end_date = subscription.end_date + relativedelta(months=1)
+        elif subscription.plan.billing_period == 'quarterly':
+            subscription.end_date = subscription.end_date + relativedelta(months=3)
+        elif subscription.plan.billing_period == 'biannual':
+            subscription.end_date = subscription.end_date + relativedelta(months=6)
+        elif subscription.plan.billing_period == 'annual':
+            subscription.end_date = subscription.end_date + relativedelta(years=1)
+        
+        subscription.status = 'active'
+        subscription.save()
+        logger.info(f"Subscription {subscription.id} extended to {subscription.end_date}")
+
+    def _update_auto_renewal_for_next_cycle(self, auto_renewal: AutoRenewal, subscription: Subscription) -> None:
+        """Update auto-renewal for next billing cycle"""
+        from dateutil.relativedelta import relativedelta
+        
+        # Set next renewal date
+        if subscription.plan.billing_period == 'monthly':
+            auto_renewal.next_renewal_date = subscription.end_date + relativedelta(months=1)
+        elif subscription.plan.billing_period == 'quarterly':
+            auto_renewal.next_renewal_date = subscription.end_date + relativedelta(months=3)
+        elif subscription.plan.billing_period == 'biannual':
+            auto_renewal.next_renewal_date = subscription.end_date + relativedelta(months=6)
+        elif subscription.plan.billing_period == 'annual':
+            auto_renewal.next_renewal_date = subscription.end_date + relativedelta(years=1)
+        
+        # Reset failure count on success
+        auto_renewal.failure_count = 0
+        auto_renewal.last_renewal_at = timezone.now()
+        auto_renewal.save()
+        
+        logger.info(f"Auto-renewal {auto_renewal.id} updated for next cycle: {auto_renewal.next_renewal_date}")
+
+    def _extract_payment_provider_info(self, auto_renewal: AutoRenewal) -> Dict[str, Any]:
+        """Extract payment provider information from AutoRenewal notes"""
+        if not auto_renewal or not auto_renewal.notes:
+            return {}
+        
+        import re
+        
+        info = {}
+        notes = auto_renewal.notes
+        
+        # Extract Paystack information
+        paystack_patterns = {
+            'subscription_code': r'paystack_subscription_code:([A-Za-z0-9_]+)',
+            'customer_code': r'paystack_customer_code:([A-Za-z0-9_]+)',
+            'plan_code': r'paystack_plan_code:([A-Za-z0-9_]+)',
+            'authorization_code': r'paystack_authorization_code:([A-Za-z0-9_]+)',
+            'email_token': r'paystack_email_token:([A-Za-z0-9_]+)'
+        }
+        
+        for key, pattern in paystack_patterns.items():
+            match = re.search(pattern, notes)
+            if match:
+                info[key] = match.group(1)
+        
+        # Extract Flutterwave information
+        flutterwave_patterns = {
+            'plan_token': r'flutterwave_plan_token:([A-Za-z0-9_]+)',
+            'plan_id': r'flutterwave_plan_id:(\d+)'
+        }
+        
+        for key, pattern in flutterwave_patterns.items():
+            match = re.search(pattern, notes)
+            if match:
+                info[key] = match.group(1)
+        
+        # Determine provider
+        if any(key.startswith('paystack_') for key in info.keys()):
+            info['provider'] = 'paystack'
+        elif any(key.startswith('flutterwave_') for key in info.keys()):
+            info['provider'] = 'flutterwave'
+        
+        return info
+
+    def _store_payment_provider_info(self, auto_renewal: AutoRenewal, payment_result: Dict[str, Any]) -> None:
+        """Store payment provider subscription info in AutoRenewal notes"""
+        try:
+            provider = payment_result.get('provider')
+            notes_parts = []
+            
+            if auto_renewal.notes:
+                notes_parts.append(auto_renewal.notes)
+            
+            if provider == 'paystack':
+                if payment_result.get('subscription_code'):
+                    notes_parts.append(f"paystack_subscription_code:{payment_result['subscription_code']}")
+                if payment_result.get('customer_code'):
+                    notes_parts.append(f"paystack_customer_code:{payment_result['customer_code']}")
+                if payment_result.get('plan_code'):
+                    notes_parts.append(f"paystack_plan_code:{payment_result['plan_code']}")
+                    
+            elif provider == 'flutterwave':
+                if payment_result.get('plan_token'):
+                    notes_parts.append(f"flutterwave_plan_token:{payment_result['plan_token']}")
+                if payment_result.get('plan_id'):
+                    notes_parts.append(f"flutterwave_plan_id:{payment_result['plan_id']}")
+            
+            auto_renewal.notes = " | ".join(notes_parts)
+            auto_renewal.save()
+            
+            logger.info(f"Stored payment provider info in AutoRenewal {auto_renewal.id}")
+            
+        except Exception as e:
+            logger.error(f"Failed to store payment provider info: {str(e)}")
+            # Don't fail the whole operation if we can't store the info
+
     def _calculate_next_renewal_date_for_auto_renewal(self, expiry_date, billing_period: str):
         """Calculate the next renewal date based on billing period (helper for SubscriptionService)"""
         from dateutil.relativedelta import relativedelta
@@ -987,7 +2333,8 @@ class AutoRenewalService:
 
     @transaction.atomic
     def create_auto_renewal(self, tenant_id: str, plan_id: str, expiry_date, 
-                           user_id: str = None, subscription_id: str = None) -> Tuple[AutoRenewal, Dict[str, Any]]:
+                           user_id: str = None, subscription_id: str = None, 
+                           payment_provider: str = None) -> Tuple[AutoRenewal, Dict[str, Any]]:
         """Create a new auto-renewal"""
         try:
             tenant_uuid = uuid.UUID(tenant_id)
@@ -1026,6 +2373,20 @@ class AutoRenewalService:
             next_renewal_date=next_renewal_date,
             status='active'
         )
+
+        # Create payment provider subscription for automatic card billing
+        if subscription and payment_provider:
+            try:
+                payment_result = self._create_payment_provider_subscription(subscription, user_id, payment_provider)
+                
+                # Store payment provider info in AutoRenewal
+                if payment_result.get('status') == 'success':
+                    self._store_payment_provider_info(auto_renewal, payment_result)
+                
+                logger.info(f"Payment provider setup for auto-renewal: {payment_result.get('status', 'unknown')}")
+            except Exception as e:
+                logger.error(f"Payment provider setup failed for auto-renewal: {str(e)}")
+                # Don't fail the auto-renewal creation if payment provider setup fails
 
         logger.info(f"Auto-renewal created for tenant {tenant_id} with plan {plan.name}")
         return auto_renewal, {
@@ -1078,44 +2439,60 @@ class AutoRenewalService:
                 if not subscription:
                     raise ValidationError("No subscription found for auto-renewal")
 
-                # Renew the subscription
-                subscription, result = self.subscription_service.renew_subscription(
-                    subscription_id=str(subscription.id),
-                    user=auto_renewal.user_id or 'system'
-                )
+                # Use the new direct charge method for payment processing
+                result = self.subscription_service.process_auto_renewal_payment(subscription, auto_renewal)
 
-                # Update auto-renewal
-                auto_renewal.status = 'active'
-                auto_renewal.last_renewal_at = timezone.now()
-                auto_renewal.failure_count = 0
-                auto_renewal.expiry_date = subscription.end_date
-                auto_renewal.next_renewal_date = self._calculate_next_renewal_date(
-                    subscription.end_date, 
-                    auto_renewal.plan.billing_period
-                )
-                auto_renewal.subscription = subscription
-                auto_renewal.save()
-
-                # Log audit
-                if subscription:
-                    self.subscription_service._audit_log(
-                        subscription,
-                        'auto_renew_processed',
-                        auto_renewal.user_id or 'system',
-                        {
-                            'auto_renewal_id': str(auto_renewal.id),
-                            'plan_name': auto_renewal.plan.name,
-                            'next_renewal_date': auto_renewal.next_renewal_date.isoformat()
-                        }
+                if result['status'] == 'success':
+                    # Update auto-renewal
+                    auto_renewal.status = 'active'
+                    auto_renewal.last_renewal_at = timezone.now()
+                    auto_renewal.failure_count = 0
+                    auto_renewal.expiry_date = subscription.end_date
+                    auto_renewal.next_renewal_date = self._calculate_next_renewal_date(
+                        subscription.end_date, 
+                        auto_renewal.plan.billing_period
                     )
+                    auto_renewal.subscription = subscription
+                    auto_renewal.save()
 
-                logger.info(f"Auto-renewal {auto_renewal_id} processed successfully")
-                return {
-                    'status': 'success',
-                    'auto_renewal_id': str(auto_renewal.id),
-                    'subscription_id': str(subscription.id),
-                    'next_renewal_date': auto_renewal.next_renewal_date.isoformat()
-                }
+                    # Log audit
+                    if subscription:
+                        self.subscription_service._audit_log(
+                            subscription,
+                            'auto_renew_processed',
+                            auto_renewal.user_id or 'system',
+                            {
+                                'auto_renewal_id': str(auto_renewal.id),
+                                'plan_name': auto_renewal.plan.name,
+                                'next_renewal_date': auto_renewal.next_renewal_date.isoformat(),
+                                'payment_result': result
+                            }
+                        )
+
+                    logger.info(f"Auto-renewal {auto_renewal_id} processed successfully")
+                    return {
+                        'status': 'success',
+                        'auto_renewal_id': str(auto_renewal.id),
+                        'subscription_id': str(subscription.id),
+                        'next_renewal_date': auto_renewal.next_renewal_date.isoformat(),
+                        'payment_details': result
+                    }
+                elif result['status'] == 'requires_action':
+                    # Payment provider requires user action
+                    auto_renewal.status = 'active'  # Keep it active for retry
+                    auto_renewal.notes = f"Requires user action: {result.get('message', 'Payment provider action needed')}"
+                    auto_renewal.save()
+                    
+                    logger.warning(f"Auto-renewal {auto_renewal_id} requires user action: {result.get('message')}")
+                    return {
+                        'status': 'requires_action',
+                        'auto_renewal_id': str(auto_renewal.id),
+                        'message': result.get('message', 'User action required for payment'),
+                        'action_required': result.get('action_required', 'user_payment_required')
+                    }
+                else:
+                    # Payment failed
+                    raise ValidationError(f"Payment processing failed: {result.get('message', 'Unknown error')}")
 
             except Exception as e:
                 # Handle renewal failure
@@ -1299,6 +2676,48 @@ class AutoRenewalService:
         
         delta = period_mapping.get(billing_period, relativedelta(months=1))
         return expiry_date + delta
+
+    def _create_payment_provider_subscription(self, subscription: Subscription, user_id: str = None, provider: str = None) -> Dict[str, Any]:
+        """
+        Create recurring billing subscription in payment provider for auto-renewal.
+        This enables automatic card billing for future renewals.
+        """
+        try:
+            # Delegate to SubscriptionService's payment provider methods
+            subscription_service = SubscriptionService(self.request)
+            
+            # Get user email for billing
+            user_email = self.request.user.email if self.request and self.request.user else None
+            if not user_email:
+                return {'status': 'skipped', 'reason': 'No user email available'}
+
+            # Build plan details for payment provider
+            plan_data = {
+                'plan_name': f"{subscription.plan.name} - {subscription.tenant_id}",
+                'amount': float(subscription.plan.price),
+                'interval': subscription.plan.billing_period,
+                'currency': settings.PAYMENT_CURRENCY,
+                'customer_email': user_email,
+                'tenant_id': str(subscription.tenant_id),
+                'subscription_id': str(subscription.id)
+            }
+
+            # Use provided provider or get from last successful payment
+            if not provider:
+                last_payment = subscription.payments.filter(status='completed').order_by('-payment_date').first()
+                provider = last_payment.provider if last_payment else list(settings.PAYMENT_PROVIDERS.keys())[0]
+            
+            if provider == 'flutterwave':
+                return subscription_service._create_flutterwave_subscription(plan_data, subscription)
+            elif provider == 'paystack':
+                return subscription_service._create_paystack_subscription(plan_data, subscription)
+            else:
+                logger.warning(f"Unsupported payment provider for auto-renew: {provider}")
+                return {'status': 'skipped', 'reason': f'Unsupported provider: {provider}'}
+
+        except Exception as e:
+            logger.error(f"Failed to create payment provider subscription for auto-renewal: {str(e)}")
+            return {'status': 'error', 'message': str(e)}
 
     @transaction.atomic
     def update_auto_renewal(self, auto_renewal_id: str, plan_id: str = None, 
