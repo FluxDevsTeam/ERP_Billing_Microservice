@@ -141,10 +141,17 @@ PAYMENT_PROVIDERS = {
         "verify_url": "https://api.flutterwave.com/v3/transactions/{}/verify",
         "secret_hash": os.getenv("FLW_SECRET_HASH"),
         "secret_key": os.getenv("FLW_SEC_KEY"),
+        "public_key": os.getenv("FLW_PUBLIC_KEY"),
+        "recurring_billing_url": "https://api.flutterwave.com/v3/bills",
+        "subscription_cancel_url": "https://api.flutterwave.com/v3/bills/{}/cancel",
     },
     "paystack": {
         "verify_url": "https://api.paystack.co/transaction/verify/{}",
         "secret_key": os.getenv("PAYSTACK_SEC_KEY"),
+        "public_key": os.getenv("PAYSTACK_PUBLIC_KEY"),
+        "plan_url": "https://api.paystack.co/plan",
+        "subscription_url": "https://api.paystack.co/subscription",
+        "subscription_disable_url": "https://api.paystack.co/subscription/disable",
     }
 }
 
@@ -153,3 +160,8 @@ TRIAL_COOLDOWN_DAYS = os.getenv("TRIAL_COOLDOWN_DAYS")
 SUBSCRIPTION_GRACE_PERIOD_DAYS = os.getenv("SUBSCRIPTION_GRACE_PERIOD_DAYS")
 TRIAL_DURATION_DAYS = os.getenv("TRIAL_DURATION_DAYS")
 ENABLE_REFUNDS = False
+
+# Payment Provider Recurring Billing Settings
+ENABLE_RECURRING_BILLING = os.getenv("ENABLE_RECURRING_BILLING", "false").lower() == "true"
+PAYMENT_PROVIDER_TIMEOUT = int(os.getenv("PAYMENT_PROVIDER_TIMEOUT", "10"))
+RECURRING_BILLING_MAX_RETRIES = int(os.getenv("RECURRING_BILLING_MAX_RETRIES", "3"))
