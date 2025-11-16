@@ -119,10 +119,11 @@ SWAGGER_SETTINGS = {
     'REFRESH_URL': os.getenv('IDENTITY_MICROSERVICE_URL', 'http://localhost:8000') + '/api/v1/user/login/refresh-token/',
 }
 
-CORS_ALLOWED_ORIGINS = [
-    os.getenv("FRONTEND_PATH", "http://localhost:5173"),
-    os.getenv("IDENTITY_MICROSERVICE_URL", "http://localhost:8000"),
-]
+CORS_ALLOW_ALL_ORIGINS = True
+# CORS_ALLOWED_ORIGINS = [
+#     os.getenv("FRONTEND_PATH", "http://localhost:5173"),
+#     os.getenv("IDENTITY_MICROSERVICE_URL", "http://localhost:8000"),
+# ]
 CORS_ALLOW_HEADERS = ['Authorization', 'Content-Type', 'Accept']
 CORS_ALLOW_METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']
 
