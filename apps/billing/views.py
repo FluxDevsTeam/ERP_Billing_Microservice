@@ -1539,6 +1539,9 @@ class AccessCheckView(viewsets.ViewSet):
             if subscription.status == 'active':
                 access = True
                 message = "Access granted"
+            elif subscription.status == 'trial':
+                access = True
+                message = "Access granted (trial)"
             elif subscription.status == 'expired':
                 if subscription.is_in_grace_period():
                     access = True

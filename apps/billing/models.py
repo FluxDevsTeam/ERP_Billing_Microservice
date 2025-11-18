@@ -200,10 +200,16 @@ class Subscription(models.Model):
         return self.auto_renew
 
     def get_remaining_days(self):
-        if self.status != 'active':
+        if self.status == 'active':
+            remaining = self.end_date - timezone.now()
+            return max(0, remaining.days)
+        elif self.status == 'trial':
+            if self.trial_end_date:
+                remaining = self.trial_end_date - timezone.now()
+                return max(0, remaining.days)
             return 0
-        remaining = self.end_date - timezone.now()
-        return max(0, remaining.days)
+        else:
+            return 0
 
     def __str__(self):
         return f"Subscription for Tenant {self.tenant_id} - {self.plan.name}"
