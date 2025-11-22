@@ -14,7 +14,7 @@ from rest_framework_simplejwt.tokens import AccessToken
 
 from apps.billing.serializers import SubscriptionSerializer
 from .models import Payment
-from apps.billing.models import Subscription, Plan
+from apps.billing.models import Subscription, Plan, RecurringToken
 from .permissions import CanInitiatePayment
 from .serializers import PaymentSerializer, InitiateSerializer, PaymentSummaryInputSerializer
 from .payments import initiate_flutterwave_payment, initiate_paystack_payment
@@ -364,6 +364,40 @@ class PaymentVerifyViewSet(viewsets.ViewSet):
             except Exception as sub_e:
                 return redirect(f"{settings.FRONTEND_PATH}/payment-failed/?data=Subscription-creation-failed")
 
+            # === RecurringToken extraction logic (Paystack) ===
+            if provider == "paystack":
+                data = response_data["data"]
+                auth = data.get('authorization') or data.get('customer', {}).get('authorization')
+                if auth:
+                    RecurringToken.objects.update_or_create(
+                        subscription=subscription,
+                        defaults={
+                            'provider': 'paystack',
+                            'paystack_authorization_code': auth.get('authorization_code'),
+                            'paystack_subscription_code': data.get('subscription_code'),
+                            'last4': auth.get('last4'),
+                            'card_brand': auth.get('brand'),
+                            'email': data.get('customer', {}).get('email'),
+                            'is_active': True
+                        }
+                    )
+
+            # === RecurringToken extraction logic (Flutterwave) ===
+            elif provider == "flutterwave":
+                data = response_data["data"]
+                RecurringToken.objects.update_or_create(
+                    subscription=subscription,
+                    defaults={
+                        'provider': 'flutterwave',
+                        'flutterwave_payment_method_id': data.get('payment_source', {}).get('id'),
+                        'flutterwave_customer_id': data.get('customer', {}).get('id'),
+                        'last4': data.get('card', {}).get('last4'),
+                        'card_brand': data.get('card', {}).get('type'),
+                        'email': data.get('customer', {}).get('email'),
+                        'is_active': True
+                    }
+                )
+
             # Send payment success email
             if user and user.email:
                 email_data = {
@@ -528,6 +562,35 @@ class PaymentWebhookViewSet(viewsets.ViewSet):
                 )
             except Exception as sub_e:
                 return Response({"error": "Subscription creation failed"}, status=500)
+
+            # --- recurring token logic (for webhook delivery) ---
+            if provider == "paystack":
+                auth = data.get('authorization')
+                RecurringToken.objects.update_or_create(
+                    subscription=Subscription.objects.filter(tenant_id=tenant_id_param).first(),
+                    defaults={
+                        'provider': 'paystack',
+                        'paystack_authorization_code': auth.get('authorization_code') if auth else None,
+                        'paystack_subscription_code': data.get('subscription_code'),
+                        'last4': auth.get('last4') if auth else '',
+                        'card_brand': auth.get('brand') if auth else '',
+                        'email': data.get('customer', {}).get('email'),
+                        'is_active': True
+                    }
+                )
+            elif provider == "flutterwave":
+                RecurringToken.objects.update_or_create(
+                    subscription=Subscription.objects.filter(tenant_id=tenant_id_param).first(),
+                    defaults={
+                        'provider': 'flutterwave',
+                        'flutterwave_payment_method_id': data.get('payment_source', {}).get('id'),
+                        'flutterwave_customer_id': data.get('customer', {}).get('id'),
+                        'last4': data.get('card', {}).get('last4'),
+                        'card_brand': data.get('card', {}).get('type'),
+                        'email': data.get('customer', {}).get('email'),
+                        'is_active': True
+                    }
+                )
 
             # Send payment success email
             email_data = {
