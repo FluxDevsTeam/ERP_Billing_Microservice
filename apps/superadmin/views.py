@@ -195,6 +195,17 @@ class SuperadminPortalViewSet(viewsets.ViewSet):
             serializer = AnalyticsSerializer(data=analytics_data)
             serializer.is_valid(raise_exception=True)
 
+            now = timezone.now()
+            currently_active_free_trials = Subscription.objects.filter(status='trial', trial_end_date__gte=now).count()
+            total_auto_renew_on = AutoRenewal.objects.filter(status='active').count()
+            total_auto_renew_off = AutoRenewal.objects.filter(status='paused').count()
+            # Placeholder for branches: optional, needs model or per-tenant sum
+            total_business_branches = 0
+            analytics_data['currently_active_free_trials'] = currently_active_free_trials
+            analytics_data['total_auto_renew_on'] = total_auto_renew_on
+            analytics_data['total_auto_renew_off'] = total_auto_renew_off
+            analytics_data['total_business_branches'] = total_business_branches
+
             return Response(serializer.data)
 
         except Exception as e:
@@ -312,3 +323,190 @@ class SuperadminPortalViewSet(viewsets.ViewSet):
         except Exception as e:
             logger.error(f"Webhook events listing failed: {str(e)}")
             return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    @swagger_helper(tags=['Superadmin Portal'], model='Payment')
+    @action(detail=False, methods=['get'], url_path='payments')
+    def list_payments(self, request):
+        """
+        List/Search all payments in the system.
+        Query params: status, provider, tenant_id, subscription_id, start_date, end_date
+        Returns: payments + aggregation summary (total, completed, failed, revenue)
+        """
+        from apps.payment.models import Payment
+        filters = {}
+        for f in ['status','provider','subscription_id','plan_id']:
+            v = request.query_params.get(f)
+            if v: filters[f] = v
+        if request.query_params.get('tenant_id'):
+            filters['subscription__tenant_id'] = request.query_params['tenant_id']
+        qs = Payment.objects.select_related('subscription','plan').filter(**filters)
+        start, end = request.query_params.get('start_date'), request.query_params.get('end_date')
+        if start and end:
+            from django.utils.dateparse import parse_datetime
+            qs = qs.filter(payment_date__range=(parse_datetime(start),parse_datetime(end)))
+        summary = {
+            'total': qs.count(),
+            'completed': qs.filter(status='completed').count(),
+            'failed': qs.filter(status='failed').count(),
+            'total_revenue': qs.filter(status='completed').aggregate(total=Sum('amount'))['total'] or 0,
+        }
+        from apps.payment.serializers import PaymentSerializer
+        results = PaymentSerializer(qs.order_by('-payment_date')[:100], many=True).data
+        return Response({'results': results, 'summary': summary})
+
+    @swagger_helper(tags=['Superadmin Portal'], model='RecurringToken')
+    @action(detail=False, methods=['get'], url_path='recurring-tokens')
+    def list_recurring_tokens(self, request):
+        """
+        List all RecurringTokens (active/inactive).
+        Filtering: status, provider, tenant, subscription. Returns token summary info for dashboard.
+        """
+        from apps.billing.models import RecurringToken
+        filters = {}
+        for f in ['provider','is_active','subscription_id']:
+            v = request.query_params.get(f)
+            if v: filters[f] = v
+        if request.query_params.get('tenant_id'):
+            filters['subscription__tenant_id'] = request.query_params['tenant_id']
+        qs = RecurringToken.objects.select_related('subscription').filter(**filters)
+        from apps.billing.serializers import RecurringTokenSerializer
+        total = qs.count()
+        actives = qs.filter(is_active=True).count()
+        results = RecurringTokenSerializer(qs.order_by('-created_at')[:100], many=True).data
+        return Response({'total': total, 'active': actives, 'results': results})
+
+    @swagger_helper(tags=['Superadmin Portal'], model='TrialUsage')
+    @action(detail=False, methods=['get'], url_path='trials')
+    def list_trials(self, request):
+        """
+        List/search all free trial usages and trial subscriptions (active, expired, tenant, machine).
+        Query params: active, expired, tenant_id, machine, start_date, end_date
+        Returns: trial list, conversion stats, and counts.
+        """
+        from apps.billing.models import TrialUsage, Subscription
+        filters = {}
+        if request.query_params.get('tenant_id'):
+            filters['tenant_id'] = request.query_params['tenant_id']
+        if request.query_params.get('machine'):
+            filters['machine_number'] = request.query_params['machine']
+        qs = TrialUsage.objects.filter(**filters)
+        active = request.query_params.get('active')
+        expired = request.query_params.get('expired')
+        if active and not expired:
+            qs = qs.filter(trial_end__gte=timezone.now())
+        if expired and not active:
+            qs = qs.filter(trial_end__lt=timezone.now())
+        start, end = request.query_params.get('start_date'), request.query_params.get('end_date')
+        if start and end:
+            from django.utils.dateparse import parse_datetime
+            qs = qs.filter(trial_start__range=(parse_datetime(start),parse_datetime(end)))
+        # Conversion count = trial usages matched to a paid subscription by tenant
+        converted_trial_count = Subscription.objects.filter(is_trial=False, status='active').values('tenant_id').distinct().count()
+        from apps.billing.serializers import TrialUsageSerializer
+        results = TrialUsageSerializer(qs.order_by('-trial_start')[:100], many=True).data
+        summary = {
+            'total_trials': qs.count(),
+            'currently_active_trials': qs.filter(trial_end__gte=timezone.now()).count(),
+            'converted_trials': converted_trial_count,
+        }
+        return Response({'results': results, 'summary': summary})
+
+    @swagger_helper(tags=['Superadmin Portal'], model='Subscription')
+    @action(detail=False, methods=['get'], url_path='expiring-soon')
+    def list_expiring_soon(self, request):
+        """
+        List all subscriptions expiring in the next 7/14/30 days. Query param: days (default 14).
+        Returns: subscriptions + summary count
+        """
+        days = int(request.query_params.get('days', '14'))
+        from django.utils import timezone
+        now = timezone.now()
+        qs = Subscription.objects.filter(
+            status='active',
+            end_date__gt=now,
+            end_date__lte=now+timedelta(days=days)
+        )
+        count = qs.count()
+        serializer = SubscriptionSerializer(qs.order_by('end_date')[:100], many=True)
+        return Response({'count': count, 'results': serializer.data})
+
+    @swagger_helper(tags=['Superadmin Portal'], model='Subscription')
+    @action(detail=False, methods=['get'], url_path='trials-ending-soon')
+    def trials_ending_soon(self, request):
+        """
+        List all trial subscriptions ending in next 7 days. Returns: subscriptions and counts.
+        """
+        from django.utils import timezone
+        now = timezone.now()
+        soon = now + timedelta(days=7)
+        qs = Subscription.objects.filter(status='trial', trial_end_date__gt=now, trial_end_date__lte=soon)
+        count = qs.count()
+        serializer = SubscriptionSerializer(qs.order_by('trial_end_date')[:100], many=True)
+        return Response({'count': count, 'results': serializer.data})
+
+    @swagger_helper(tags=['Superadmin Portal'], model='Subscription')
+    @action(detail=False, methods=['get'], url_path='at-limit-or-high-usage')
+    def expiring_high_usage(self, request):
+        """
+        List all active subscriptions with users/branches at >=90% of plan limits.
+        Returns: subscription list and warning/alert count for dashboard.
+        """
+        qs = Subscription.objects.select_related('plan').filter(status='active')
+        alerts = []
+        for s in qs:
+            # assuming s.current_user_count and s.current_branch_count exist
+            if hasattr(s, 'current_user_count') and hasattr(s, 'current_branch_count'):
+                if (
+                    s.current_user_count >= 0.9*s.plan.max_users or
+                    s.current_branch_count >= 0.9*s.plan.max_branches
+                ):
+                    alerts.append(s)
+        serializer = SubscriptionSerializer(alerts, many=True)
+        return Response({'count': len(alerts), 'results': serializer.data})
+
+    @action(detail=False, methods=['get'], url_path='activity-feed')
+    def activity_feed(self, request):
+        """
+        System-wide (global) activity feed for dashboard.
+        Returns the 200 most recent events (subscription create/extend, payment, trial, plan change, failures, etc).
+        """
+        from apps.billing.models import Subscription, AuditLog
+        from apps.payment.models import Payment
+        from apps.billing.models import TrialUsage
+        feed = []
+        # AuditLog events (system actions)
+        for log in AuditLog.objects.select_related('subscription').order_by('-timestamp')[:75]:
+            feed.append({
+                'type': f'audit:{log.action}',
+                'timestamp': log.timestamp,
+                'subscription_id': str(log.subscription_id) if log.subscription_id else None,
+                'tenant_id': getattr(log.subscription, 'tenant_id', None) if hasattr(log, 'subscription') else None,
+                'details': log.details,
+            })
+        # Payments (completed/failed)
+        for p in Payment.objects.select_related('subscription').filter(status__in=['completed','failed']).order_by('-payment_date')[:75]:
+            feed.append({
+                'type': f'payment:{p.status}',
+                'timestamp': p.payment_date,
+                'subscription_id': str(p.subscription_id) if p.subscription_id else None,
+                'tenant_id': getattr(p.subscription, 'tenant_id', None) if hasattr(p, 'subscription') else None,
+                'amount': float(p.amount), 'provider': p.provider,
+            })
+        # Free trials started
+        for t in TrialUsage.objects.order_by('-trial_start')[:30]:
+            feed.append({
+                'type': 'trial:start',
+                'timestamp': t.trial_start,
+                'tenant_id': t.tenant_id, 'machine_number': t.machine_number
+            })
+        # Subscription events: create, expired, canceled
+        for s in Subscription.objects.order_by('-updated_at')[:25]:
+            feed.append({
+                'type': f'subscription:{s.status}',
+                'timestamp': s.updated_at,
+                'subscription_id': str(s.id),
+                'tenant_id': s.tenant_id
+            })
+        # Sort all by descending timestamp
+        feed.sort(key=lambda x: x['timestamp'], reverse=True)
+        return Response({'count': len(feed), 'results': feed[:200]})

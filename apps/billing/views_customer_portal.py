@@ -21,7 +21,7 @@ from .utils import swagger_helper
 from .services import SubscriptionService, AutoRenewalService
 
 
-class CustomerPortalViewSet(viewsets.ViewSet):
+class CustomerPortalViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated, CanViewEditSubscription]
 
     @action(detail=False, methods=['get'], url_path='details')
