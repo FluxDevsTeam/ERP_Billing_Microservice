@@ -123,7 +123,7 @@ class PlanView(viewsets.ModelViewSet):
                 'timestamp': timezone.now().isoformat()
             }, status=status.HTTP_503_SERVICE_UNAVAILABLE)
 
-    @swagger_helper("Plan", "list")
+    @swagger_helper("Plan", "list_plans")
     def list(self, request, *args, **kwargs):
         return super().list(request, *args, **kwargs)
 
