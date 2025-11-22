@@ -16,16 +16,8 @@ urlpatterns = [
     # SubscriptionView
     path('subscriptions/', SubscriptionView.as_view({'get': 'list', 'post': 'create'}), name='subscription_list_create'),
     path('subscriptions/<uuid:pk>/', SubscriptionView.as_view({'get': 'retrieve', 'put': 'update', 'patch': 'partial_update', 'delete': 'destroy'}), name='subscription_detail'),
-    path('subscriptions/<uuid:pk>/renew/', SubscriptionView.as_view({'post': 'renew_subscription'}), name='subscription_renew'),
     path('subscriptions/<uuid:pk>/suspend/', SubscriptionView.as_view({'post': 'suspend_subscription'}), name='subscription_suspend'),
-    path('subscriptions/<uuid:pk>/change-plan/', SubscriptionView.as_view({'post': 'change_plan'}), name='subscription_change_plan'),
-    path('subscriptions/<uuid:pk>/advance-renewal/', SubscriptionView.as_view({'post': 'advance_renewal'}), name='subscription_advance_renewal'),
-    path('subscriptions/<uuid:pk>/extend/', SubscriptionView.as_view({'post': 'extend_subscription'}), name='subscription_extend'),
-    path('subscriptions/<uuid:pk>/toggle-auto-renew/', SubscriptionView.as_view({'post': 'toggle_auto_renew'}), name='subscription_toggle_auto_renew'),
     path('subscriptions/<uuid:pk>/audit-logs/', SubscriptionView.as_view({'get': 'get_audit_logs'}), name='subscription_audit_logs'),
-    path('subscriptions/<uuid:pk>/change-card/', SubscriptionView.as_view({'post': 'change_subscription_card'}), name='subscription_change_card'),
-    path('subscriptions/<uuid:pk>/payment-info/', SubscriptionView.as_view({'get': 'get_payment_provider_info'}), name='subscription_payment_info'),
-    path('subscriptions/<uuid:pk>/update-payment-method/', SubscriptionView.as_view({'post': 'update_payment_method'}), name='subscription_update_payment_method'),
     # path('subscriptions/check-expired/', SubscriptionView.as_view({'post': 'check_expired_subscriptions'}), name='subscription_check_expired'),
     path('subscriptions/activate-trial/', SubscriptionView.as_view({'post': 'activate_trial'}), name='subscription_activate_trial'),
 
@@ -35,6 +27,14 @@ urlpatterns = [
     path('customer-portal/advance-renewal/', CustomerPortalViewSet.as_view({'post': 'advance_renewal'}), name='customer_portal_advance_renewal'),
     path('customer-portal/extend/', CustomerPortalViewSet.as_view({'post': 'extend_subscription'}), name='customer_portal_extend'),
     path('customer-portal/toggle-auto-renew/', CustomerPortalViewSet.as_view({'post': 'toggle_auto_renew'}), name='customer_portal_toggle_auto_renew'),
+    path('customer-portal/subscriptions/<uuid:pk>/renew/', CustomerPortalViewSet.as_view({'post': 'renew_subscription'}), name='subscription_renew'),
+    path('customer-portal/subscriptions/<uuid:pk>/change-plan/', CustomerPortalViewSet.as_view({'post': 'change_plan'}), name='subscription_change_plan'),
+    path('customer-portal/subscriptions/<uuid:pk>/advance-renewal/', CustomerPortalViewSet.as_view({'post': 'advance_renewal'}), name='subscription_advance_renewal'),
+    path('customer-portal/subscriptions/<uuid:pk>/extend/', CustomerPortalViewSet.as_view({'post': 'extend_subscription'}), name='subscription_extend'),
+    path('customer-portal/subscriptions/<uuid:pk>/toggle-auto-renew/', CustomerPortalViewSet.as_view({'post': 'toggle_auto_renew'}), name='subscription_toggle_auto_renew'),
+    path('customer-portal/subscriptions/<uuid:pk>/change-card/', CustomerPortalViewSet.as_view({'post': 'change_subscription_card'}), name='subscription_change_card'),
+    path('customer-portal/subscriptions/<uuid:pk>/payment-info/', CustomerPortalViewSet.as_view({'get': 'get_payment_provider_info'}), name='subscription_payment_info'),
+    path('customer-portal/subscriptions/<uuid:pk>/update-payment-method/', CustomerPortalViewSet.as_view({'post': 'update_payment_method'}), name='subscription_update_payment_method'),
 
     # AutoRenewalViewSet
     path('auto-renewals/', AutoRenewalViewSet.as_view({'get': 'list', 'post': 'create'}), name='auto_renewal_list_create'),

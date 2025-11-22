@@ -318,3 +318,31 @@ class TrialUsage(models.Model):
     def __str__(self):
         machine_info = f" - Machine: {self.machine_number}" if self.machine_number else ""
         return f"Trial for Tenant {self.tenant_id} - {self.user_email}{machine_info}"
+
+
+class RecurringToken(models.Model):
+    """Model to store recurring payment tokens for subscriptions"""
+    PROVIDER_CHOICES = (
+        ('paystack', 'Paystack'),
+        ('flutterwave', 'Flutterwave'),
+    )
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    subscription = models.OneToOneField(Subscription, on_delete=models.CASCADE, related_name='recurring_token')
+    provider = models.CharField(max_length=20, choices=PROVIDER_CHOICES)
+    paystack_subscription_code = models.CharField(max_length=255, null=True, blank=True, help_text="Paystack subscription code for managing recurring payments")
+    last4 = models.CharField(max_length=4, null=True, blank=True, help_text="Last 4 digits of card")
+    card_brand = models.CharField(max_length=50, null=True, blank=True, help_text="Card brand (Visa, Mastercard, etc.)")
+    email = models.EmailField(null=True, blank=True, help_text="Email associated with payment method")
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['provider', 'is_active']),
+            models.Index(fields=['subscription', 'is_active']),
+        ]
+
+    def __str__(self):
+        return f"{self.provider} token for {self.subscription.tenant_id} - {self.last4 or 'N/A'}"
