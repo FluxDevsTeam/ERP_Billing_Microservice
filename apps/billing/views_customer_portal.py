@@ -10,7 +10,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-from .models import Plan, Subscription, AutoRenewal, RecurringToken
+from .models import Plan, Subscription, TenantBillingPreferences
 from apps.payment.models import Payment
 from .serializers import (
     SubscriptionSerializer, PaymentSerializer,
@@ -18,7 +18,7 @@ from .serializers import (
 )
 from .permissions import CanViewEditSubscription
 from .utils import swagger_helper
-from .services import SubscriptionService, AutoRenewalService
+from .services import SubscriptionService
 
 
 class CustomerPortalViewSet(viewsets.ModelViewSet):
@@ -115,610 +115,360 @@ class CustomerPortalViewSet(viewsets.ModelViewSet):
             print(f"CustomerPortalViewSet.change_plan: Unexpected error - {str(e)}")
             return Response({'error': 'Plan change failed'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-    @action(detail=False, methods=['post'], url_path='advance-renewal')
-    @swagger_helper("Customer Portal", "advance_renewal")
-    def advance_renewal(self, request):
-        try:
-            tenant_id = getattr(request.user, 'tenant', None)
-            if not tenant_id:
-                print("CustomerPortalViewSet.advance_renewal: No tenant associated with user")
-                return Response({'error': 'No tenant associated with user'}, status=status.HTTP_403_FORBIDDEN)
-
-            subscription = Subscription.objects.filter(tenant_id=tenant_id).first()
-            if not subscription:
-                print("CustomerPortalViewSet.advance_renewal: No subscription found")
-                return Response({'error': 'No subscription found'}, status=status.HTTP_404_NOT_FOUND)
-
-            serializer = AdvanceRenewalSerializer(data=request.data)
-            serializer.is_valid(raise_exception=True)
-            subscription_service = SubscriptionService(request)
-            subscription, result = subscription_service.renew_in_advance(
-                subscription_id=str(subscription.id),
-                periods=serializer.validated_data['periods'],
-                plan_id=serializer.validated_data.get('plan_id'),
-                user=str(request.user.id)
-            )
-
-            print(
-                f"CustomerPortalViewSet.advance_renewal: Advance renewal for subscription_id={subscription.id}, periods={serializer.validated_data['periods']}")
-            return Response({
-                'data': 'Subscription renewed in advance successfully.',
-                'subscription': SubscriptionSerializer(subscription).data,
-                'periods': result['periods'],
-                'amount': result['amount']
-            })
-
-        except ValidationError as e:
-            print(f"CustomerPortalViewSet.advance_renewal: Validation error - {str(e)}")
-            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
-        except Exception as e:
-            print(f"CustomerPortalViewSet.advance_renewal: Unexpected error - {str(e)}")
-            return Response({'error': 'Advance renewal failed'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=False, methods=['post'], url_path='toggle-auto-renew')
     @swagger_helper("Customer Portal", "toggle_auto_renew")
     def toggle_auto_renew(self, request):
+        """
+        NEW SIMPLIFIED VERSION: Toggle auto-renewal using TenantBillingPreferences
+        """
         try:
             tenant_id = getattr(request.user, 'tenant', None)
             if not tenant_id:
-                print("CustomerPortalViewSet.toggle_auto_renew: No tenant associated with user")
+                return Response({'error': 'No tenant associated with user'}, status=status.HTTP_403_FORBIDDEN)
+
+            serializer = AutoRenewToggleSerializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+            auto_renew = serializer.validated_data['auto_renew']
+
+            # Get or create tenant billing preferences (one record per tenant)
+            preferences, created = TenantBillingPreferences.objects.get_or_create(
+                tenant_id=tenant_id,
+                defaults={'user_id': str(request.user.id)}
+            )
+
+            # Simply update the auto-renewal setting
+            preferences.auto_renew_enabled = auto_renew
+            preferences.save()
+
+            message = 'Auto-renew enabled successfully.' if auto_renew else 'Auto-renew disabled successfully.'
+
+            # Get current subscription for response
+            subscription = Subscription.objects.filter(tenant_id=tenant_id).first()
+            subscription_data = SubscriptionSerializer(subscription).data if subscription else None
+
+            return Response({
+                'data': message,
+                'subscription': subscription_data,
+                'auto_renew': auto_renew,
+                'preferences_updated': True
+            })
+
+        except ValidationError as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            logger.error(f"Auto-renew toggle failed: {str(e)}")
+            return Response({'error': 'Auto-renew toggle failed'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    @action(detail=False, methods=['post'], url_path='extend')
+    @swagger_helper("Customer Portal", "extend")
+    def extend(self, request):
+        """
+        Smart extension endpoint that handles:
+        - Emergency extension when < 30 days remaining
+        - Advance renewal (pay ahead for next period)
+        - Optional plan change effective at end of current period
+        - FULLY SUPPORTS CARD UPDATES FOR BOTH PAYSTACK & FLUTTERWAVE
+        """
+        try:
+            tenant_id = getattr(request.user, 'tenant', None)
+            if not tenant_id:
                 return Response({'error': 'No tenant associated with user'}, status=status.HTTP_403_FORBIDDEN)
 
             subscription = Subscription.objects.filter(tenant_id=tenant_id).first()
             if not subscription:
-                print("CustomerPortalViewSet.toggle_auto_renew: No subscription found")
                 return Response({'error': 'No subscription found'}, status=status.HTTP_404_NOT_FOUND)
 
-            serializer = AutoRenewToggleSerializer(data=request.data)
-            serializer.is_valid(raise_exception=True)
-            auto_renew = serializer.validated_data['auto_renew']
-            
-            auto_renewal_service = AutoRenewalService(request)
-            
-            # Find existing auto-renewal for this subscription
-            auto_renewal = AutoRenewal.objects.filter(
-                subscription_id=subscription.id,
-                status__in=['active', 'paused', 'canceled']
-            ).first()
-            
-            if auto_renew and not auto_renewal:
-                # Create auto-renewal
-                auto_renewal, result = auto_renewal_service.create_auto_renewal(
-                    tenant_id=str(tenant_id),
-                    plan_id=str(subscription.plan.id),
-                    expiry_date=subscription.end_date,
-                    user_id=str(request.user.id),
-                    subscription_id=str(subscription.id)
-                )
-                message = 'Auto-renew enabled successfully.'
-            elif not auto_renew and auto_renewal:
-                # Cancel auto-renewal
-                auto_renewal, result = auto_renewal_service.cancel_auto_renewal(
-                    auto_renewal_id=str(auto_renewal.id),
-                    user_id=str(request.user.id)
-                )
-                message = 'Auto-renew disabled successfully.'
-            elif auto_renew and auto_renewal and auto_renewal.status != 'active':
-                # Reactivate auto-renewal
-                auto_renewal, result = auto_renewal_service.update_auto_renewal(
-                    auto_renewal_id=str(auto_renewal.id),
-                    status='active',
-                    user_id=str(request.user.id)
-                )
-                message = 'Auto-renew enabled successfully.'
-            else:
-                message = 'Auto-renew status is already set as requested.'
+            # Parse request data
+            periods = request.data.get('periods', 1)
+            new_plan_id = request.data.get('new_plan_id')
+            provider = request.data.get('provider', 'paystack').lower()
 
-            print(
-                f"CustomerPortalViewSet.toggle_auto_renew: Auto-renew toggled to {auto_renew} for subscription_id={subscription.id}")
-            return Response({
-                'data': message,
-                'subscription': SubscriptionSerializer(subscription).data,
-                'auto_renew': auto_renew
-            })
+            # Extract Flutterwave token if provided (for card updates)
+            flutterwave_token = request.data.get("flutterwave_token")  # ← FROM FRONTEND
 
-        except ValidationError as e:
-            print(f"CustomerPortalViewSet.toggle_auto_renew: Validation error - {str(e)}")
-            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
-        except Exception as e:
-            print(f"CustomerPortalViewSet.toggle_auto_renew: Unexpected error - {str(e)}")
-            logger.error(f"Auto-renew toggle failed: {str(e)}")
-            return Response({'error': 'Auto-renew toggle failed'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            # Validate periods
+            if periods < 1:
+                return Response({'error': 'Periods must be at least 1'}, status=status.HTTP_400_BAD_REQUEST)
 
-    @action(detail=True, methods=['post'], url_path='extend')
-    @swagger_helper("Customer Portal", "extend_subscription")
-    def extend_subscription(self, request, pk=None):
-        """
-        Extend subscription when remaining days is below 30.
-        This triggers a payment flow (redirects to payment page) - user must pay to extend.
-        After successful payment, subscription will be extended by one billing period.
-        """
-        try:
-            subscription = self.get_object()
-
-            # Validate subscription can be extended
-            if subscription.status not in ['active', 'expired']:
-                return Response({'error': 'Subscription must be active or expired to extend'},
-                              status=status.HTTP_400_BAD_REQUEST)
-
+            # Check business rules
             remaining_days = subscription.get_remaining_days()
-            if remaining_days >= 30:
-                return Response({'error': 'Subscription can only be extended when remaining days is less than 30'},
-                              status=status.HTTP_400_BAD_REQUEST)
+            is_advance_renewal = remaining_days >= 30
 
-            # Calculate amount (one billing period)
+            # Rule 1: Check for existing advance renewal
+            billing_prefs = subscription.tenant_billing_preferences
+            if is_advance_renewal and billing_prefs and billing_prefs.next_renewal_date:
+                if billing_prefs.next_renewal_date > subscription.end_date:
+                    return Response({
+                        'error': 'You already have an advance renewal pending. Wait until your current period ends.'
+                    }, status=status.HTTP_400_BAD_REQUEST)
+
+            # Rule 2: Emergency extension requires < 30 days
+            if not is_advance_renewal and remaining_days >= 30:
+                return Response({
+                    'error': 'Emergency extension only available when less than 30 days remaining'
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            # Validate subscription status
+            if subscription.status not in ['active', 'expired']:
+                return Response({
+                    'error': f'Subscription cannot be extended (status: {subscription.status})'
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            # Validate new plan if provided
+            new_plan = None
+            if new_plan_id:
+                try:
+                    new_plan = Plan.objects.get(id=new_plan_id)
+                    if not new_plan.is_active or new_plan.discontinued:
+                        return Response({'error': 'New plan is not available'}, status=status.HTTP_400_BAD_REQUEST)
+                except Plan.DoesNotExist:
+                    return Response({'error': 'New plan does not exist'}, status=status.HTTP_400_BAD_REQUEST)
+
+            # Calculate amount
+            plan_for_calculation = new_plan if new_plan else subscription.plan
             from decimal import Decimal
-            amount = Decimal(str(subscription.plan.price))
-            provider = request.data.get('provider', 'paystack')
+            amount = Decimal(str(plan_for_calculation.price)) * periods
 
-            # Get tenant information
-            tenant_id = getattr(request.user, 'tenant', None)
-            if not tenant_id:
-                return Response({'error': 'No tenant associated with user'},
-                              status=status.HTTP_400_BAD_REQUEST)
-
-            # Create payment record for tracking
+            # Create payment record
             payment = Payment.objects.create(
-                plan=subscription.plan,
+                plan=plan_for_calculation,
                 subscription=subscription,
                 amount=amount,
                 transaction_id=str(uuid.uuid4()),
                 status='pending',
                 provider=provider,
-                payment_type='extension'  # Mark as extension payment (will use 'advance' if 'extension' not available)
+                payment_type='extension' if not is_advance_renewal else 'advance_renewal'
             )
 
-            # Initialize payment based on provider (same as manual-payment-new-card)
-            if provider == 'paystack':
-                from .payments import initiate_paystack_payment
-                from .utils import generate_confirm_token
-                confirm_token = generate_confirm_token(request.user, str(subscription.plan.id))
+            # Handle scheduled plan change
+            if new_plan:
+                subscription.scheduled_plan = new_plan
+                subscription.save()
 
-                response = initiate_paystack_payment(
-                    confirm_token=confirm_token,
-                    amount=float(amount),
-                    user=request.user,
-                    plan_id=str(subscription.plan.id),
-                    tenant_id=str(tenant_id),
-                    tenant_name=getattr(request.user, 'tenant_name', None),
-                    metadata={'action': 'extend_subscription', 'subscription_id': str(subscription.id)}
-                )
-
-            elif provider == 'flutterwave':
-                from .payments import initiate_flutterwave_payment
-                from .utils import generate_confirm_token
-                confirm_token = generate_confirm_token(request.user, str(subscription.plan.id))
-
-                response = initiate_flutterwave_payment(
-                    confirm_token=confirm_token,
-                    amount=float(amount),
-                    user=request.user,
-                    plan_id=str(subscription.plan.id),
-                    tenant_id=str(tenant_id),
-                    tenant_name=getattr(request.user, 'tenant_name', None),
-                    metadata={'action': 'extend_subscription', 'subscription_id': str(subscription.id)}
-                )
-            else:
-                payment.delete()
-                return Response({'error': f'Unsupported payment provider: {provider}'},
-                              status=status.HTTP_400_BAD_REQUEST)
-
-            if response.status_code == 200:
-                response_data = response.data
-                return Response({
-                    'data': 'Payment initiated for subscription extension. Complete payment to extend your subscription.',
-                    'payment_id': str(payment.id),
-                    'subscription_id': str(subscription.id),
-                    'payment_url': response_data.get('payment_link'),
-                    'authorization_url': response_data.get('authorization_url'),
-                    'reference': response_data.get('tx_ref'),
-                    'amount': str(amount),
-                    'provider': provider,
-                    'periods': 1,
-                    'remaining_days_before': remaining_days,
-                    'message': 'Please complete payment to extend your subscription by one billing period'
-                })
-            else:
-                payment.delete()
-                error_data = response.data if hasattr(response, 'data') else {'error': 'Payment initialization failed'}
-                return Response(error_data, status=response.status_code)
-
-        except ValidationError as e:
-            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
-        except Exception as e:
-            logger.error(f"Subscription extension failed: {str(e)}")
-            return Response({'error': 'Subscription extension failed'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-    @action(detail=True, methods=['post'], url_path='renew')
-    @swagger_helper("Customer Portal", "renew_subscription")
-    def renew_subscription(self, request, pk=None):
-        try:
-            subscription = self.get_object()
-            subscription_service = SubscriptionService(request)
-            subscription, result = subscription_service.renew_subscription(
-                subscription_id=pk,
-                user=str(request.user.id)
-            )
-
-            # Send renewal confirmation email
-            email_data = {
-                'user_email': request.user.email,
-                'email_type': 'confirmation',
-                'subject': 'Subscription Renewed',
-                'message': f'Your subscription has been renewed successfully. Next renewal date: {subscription.end_date.strftime("%Y-%m-%d")}',
-                'action': 'Subscription Renewed'
-            }
-            send_email_via_service(email_data)
-
-            serializer = SubscriptionSerializer(subscription)
-            print(f"CustomerPortalViewSet.renew_subscription: Subscription renewed for id={pk}")
-            return Response({
-                'data': 'Subscription renewed successfully.',
-                'subscription': serializer.data
-            })
-
-        except ValidationError as e:
-            print(f"CustomerPortalViewSet.renew_subscription: Validation error - {str(e)}")
-            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
-        except Exception as e:
-            print(f"CustomerPortalViewSet.renew_subscription: Unexpected error - {str(e)}")
-            return Response({'error': 'Subscription renewal failed'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-    @action(detail=True, methods=['post'], url_path='change-plan')
-    @swagger_helper("Customer Portal", "change_plan")
-    def change_plan_detail(self, request, pk=None):
-        try:
-            subscription = self.get_object()
-            serializer = PlanChangeSerializer(data=request.data, context={'subscription': subscription})
-            serializer.is_valid(raise_exception=True)
-            subscription_service = SubscriptionService(request)
-            subscription, result = subscription_service.change_plan(
-                subscription_id=pk,
-                new_plan_id=serializer.validated_data['new_plan_id'],
-                user=str(request.user.id),
-                immediate=True  # Always immediate now, upgrades happen immediately, downgrades are scheduled
-            )
-
-            # Send plan change confirmation email
-            change_message = f'Your plan has been changed from {result["old_plan"]} to {result["new_plan"]}.'
-            if result.get('is_upgrade'):
-                change_message += f' Remaining value: {result.get("remaining_value", 0):.2f}, Amount to pay: {result.get("prorated_amount", 0):.2f}'
-            elif result.get('is_downgrade'):
-                change_message += ' Downgrade scheduled for after current period ends.'
-
-            email_data = {
-                'user_email': request.user.email,
-                'email_type': 'confirmation',
-                'subject': 'Plan Change Confirmation',
-                'message': change_message,
-                'action': 'Plan Changed'
-            }
-            send_email_via_service(email_data)
-
-            serializer = SubscriptionSerializer(subscription)
-            print(
-                f"CustomerPortalViewSet.change_plan_detail: Plan changed for subscription_id={pk}, new_plan_id={serializer.validated_data['new_plan_id']}")
-            return Response({
-                'data': 'Plan changed successfully.',
-                'subscription': serializer.data,
-                'old_plan': result.get('old_plan'),
-                'new_plan': result.get('new_plan'),
-                'change_type': result.get('change_type'),
-                'is_upgrade': result.get('is_upgrade'),
-                'is_downgrade': result.get('is_downgrade'),
-                'prorated_amount': result.get('prorated_amount'),
-                'remaining_value': result.get('remaining_value'),
-                'remaining_days': result.get('remaining_days'),
-                'requires_payment': result.get('requires_payment'),
-                'scheduled': result.get('scheduled', False)
-            })
-
-        except ValidationError as e:
-            print(f"CustomerPortalViewSet.change_plan_detail: Validation error - {str(e)}")
-            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
-        except Exception as e:
-            print(f"CustomerPortalViewSet.change_plan_detail: Unexpected error - {str(e)}")
-            return Response({'error': 'Plan change failed'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-    @action(detail=True, methods=['post'], url_path='advance-renewal')
-    @swagger_helper("Customer Portal", "advance_renewal")
-    def advance_renewal_detail(self, request, pk=None):
-        """
-        DEPRECATED: Use /extend/ endpoint instead (when < 30 days remaining) or manual-payment for multiple periods.
-        This endpoint triggers payment flow for advance renewal (multiple periods).
-        """
-        try:
-            serializer = AdvanceRenewalSerializer(data=request.data)
-            serializer.is_valid(raise_exception=True)
-            subscription = self.get_object()
-
-            periods = serializer.validated_data['periods']
-            plan_id = serializer.validated_data.get('plan_id')
-            plan = subscription.plan
-            if plan_id:
-                plan = Plan.objects.get(id=plan_id)
-
-            from decimal import Decimal
-            amount = Decimal(str(plan.price)) * periods
-            provider = request.data.get('provider', 'paystack')
-
-            # Get tenant information
-            tenant_id = getattr(request.user, 'tenant', None)
-            if not tenant_id:
-                return Response({'error': 'No tenant associated with user'},
-                              status=status.HTTP_400_BAD_REQUEST)
-
-            # Create payment record for tracking
-            payment = Payment.objects.create(
-                plan=plan,
-                subscription=subscription,
-                amount=amount,
-                transaction_id=str(uuid.uuid4()),
-                status='pending',
-                provider=provider,
-                payment_type='advance_renewal',
-                metadata={'periods': periods}
-            )
-
-            # Initialize payment flow (same as extend/manual-payment-new-card)
-            if provider == 'paystack':
-                from .payments import initiate_paystack_payment
-                from .utils import generate_confirm_token
-                confirm_token = generate_confirm_token(request.user, str(plan.id))
-
-                response = initiate_paystack_payment(
-                    confirm_token=confirm_token,
-                    amount=float(amount),
-                    user=request.user,
-                    plan_id=str(plan.id),
-                    tenant_id=str(tenant_id),
-                    tenant_name=getattr(request.user, 'tenant_name', None),
-                    metadata={'action': 'advance_renewal', 'periods': periods, 'subscription_id': str(subscription.id)}
-                )
-
-            elif provider == 'flutterwave':
-                from .payments import initiate_flutterwave_payment
-                from .utils import generate_confirm_token
-                confirm_token = generate_confirm_token(request.user, str(plan.id))
-
-                response = initiate_flutterwave_payment(
-                    confirm_token=confirm_token,
-                    amount=float(amount),
-                    user=request.user,
-                    plan_id=str(plan.id),
-                    tenant_id=str(tenant_id),
-                    tenant_name=getattr(request.user, 'tenant_name', None),
-                    metadata={'action': 'advance_renewal', 'periods': periods, 'subscription_id': str(subscription.id)}
-                )
-            else:
-                payment.delete()
-                return Response({'error': f'Unsupported payment provider: {provider}'},
-                              status=status.HTTP_400_BAD_REQUEST)
-
-            if response.status_code == 200:
-                response_data = response.data
-                return Response({
-                    'data': 'Advance renewal payment initiated. Complete payment to renew subscription.',
-                    'payment_id': str(payment.id),
-                    'subscription_id': str(subscription.id),
-                    'payment_url': response_data.get('payment_link'),
-                    'authorization_url': response_data.get('authorization_url'),
-                    'reference': response_data.get('tx_ref'),
-                    'amount': str(amount),
-                    'periods': periods,
-                    'provider': provider,
-                    'message': 'Please complete payment to renew subscription in advance'
-                })
-            else:
-                payment.delete()
-                error_data = response.data if hasattr(response, 'data') else {'error': 'Payment initialization failed'}
-                return Response(error_data, status=response.status_code)
-
-        except ValidationError as e:
-            print(f"CustomerPortalViewSet.advance_renewal_detail: Validation error - {str(e)}")
-            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
-        except Exception as e:
-            print(f"CustomerPortalViewSet.advance_renewal_detail: Unexpected error - {str(e)}")
-            return Response({'error': 'Advance renewal failed'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-    @action(detail=True, methods=['post'], url_path='toggle-auto-renew')
-    @swagger_helper("Customer Portal", "toggle_auto_renew")
-    def toggle_auto_renew_detail(self, request, pk=None):
-        try:
-            serializer = AutoRenewToggleSerializer(data=request.data)
-            serializer.is_valid(raise_exception=True)
-            auto_renew = serializer.validated_data['auto_renew']
-
-            subscription = self.get_object()
-            auto_renewal_service = AutoRenewalService(request)
-
-            # Find existing auto-renewal for this subscription
-            auto_renewal = AutoRenewal.objects.filter(
-                subscription_id=pk,
-                status__in=['active', 'paused']
-            ).first()
-
-            if auto_renew and not auto_renewal:
-                # Create auto-renewal
-                auto_renewal, result = auto_renewal_service.create_auto_renewal(
-                    tenant_id=str(subscription.tenant_id),
-                    plan_id=str(subscription.plan.id),
-                    expiry_date=subscription.end_date,
-                    user_id=str(request.user.id),
-                    subscription_id=pk
-                )
-                message = 'Auto-renew enabled successfully.'
-            elif not auto_renew and auto_renewal:
-                # Cancel auto-renewal
-                auto_renewal, result = auto_renewal_service.cancel_auto_renewal(
-                    auto_renewal_id=str(auto_renewal.id),
-                    user_id=str(request.user.id)
-                )
-                message = 'Auto-renew disabled successfully.'
-            elif auto_renew and auto_renewal and auto_renewal.status != 'active':
-                # Reactivate auto-renewal
-                auto_renewal, result = auto_renewal_service.update_auto_renewal(
-                    auto_renewal_id=str(auto_renewal.id),
-                    status='active',
-                    user_id=str(request.user.id)
-                )
-                message = 'Auto-renew enabled successfully.'
-            else:
-                message = 'Auto-renew status is already set as requested.'
-
-            serializer = SubscriptionSerializer(subscription)
-            return Response({
-                'data': message,
-                'subscription': serializer.data,
-                'auto_renew': auto_renew
-            })
-
-        except ValidationError as e:
-            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
-        except Exception as e:
-            logger.error(f"Auto-renew toggle failed: {str(e)}")
-            return Response({'error': 'Auto-renew toggle failed'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-    @action(detail=True, methods=['post'], url_path='change-card')
-    @swagger_helper("Customer Portal", "change_subscription_card")
-    def change_subscription_card(self, request, pk=None):
-        """
-        Change the payment card for auto-renewal subscription.
-
-        Body params (JSON):
-        - new_authorization_code: The authorization code from new payment (required for Paystack)
-        - provider: Payment provider ('paystack' or 'flutterwave')
-        """
-        try:
-            subscription = self.get_object()
-            subscription_service = SubscriptionService(request)
-
-            new_authorization_code = request.data.get('new_authorization_code')
-            provider = request.data.get('provider', 'paystack')
-
-            if not new_authorization_code:
-                return Response(
-                    {'error': 'new_authorization_code is required for card change'},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-
-            if provider == 'flutterwave':
-                return Response(
-                    {
-                        'error': 'Flutterwave does not support direct card changes',
-                        'message': 'Please make a new payment with the desired card. It will automatically be used for future renewals.',
-                        'action_required': 'new_payment'
-                    },
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-
-            result = subscription_service.change_subscription_card(
-                subscription_id=pk,
-                new_payment_token=new_authorization_code,
-                user=str(request.user.id)
-            )
-
-            if result['status'] == 'success':
-                # Send confirmation email
-                email_data = {
-                    'user_email': request.user.email,
-                    'email_type': 'confirmation',
-                    'subject': 'Payment Card Updated',
-                    'message': f'Your payment card has been successfully updated for auto-renewal. New subscription code: {result.get("new_subscription_code", "N/A")}',
-                    'action': 'Card Updated'
+            # Update next renewal date for advance renewal
+            if is_advance_renewal:
+                if not billing_prefs:
+                    billing_prefs = TenantBillingPreferences.objects.create(
+                        tenant_id=tenant_id,
+                        user_id=str(request.user.id)
+                    )
+                from dateutil.relativedelta import relativedelta
+                period_mapping = {
+                    'monthly': relativedelta(months=periods),
+                    'quarterly': relativedelta(months=3*periods),
+                    'biannual': relativedelta(months=6*periods),
+                    'annual': relativedelta(years=periods),
                 }
-                send_email_via_service(email_data)
+                delta = period_mapping.get(subscription.plan.billing_period, relativedelta(months=periods))
+                billing_prefs.next_renewal_date = subscription.end_date + delta
+                billing_prefs.save()
 
-                return Response({
-                    'data': 'Payment card updated successfully for auto-renewal',
-                    'subscription_id': str(subscription.id),
-                    'new_subscription_code': result.get('new_subscription_code'),
-                    'provider': provider
-                })
-            else:
-                return Response(
-                    {'error': result.get('message', 'Card change failed')},
-                    status=status.HTTP_400_BAD_REQUEST
+            # Generate metadata (CRITICAL: includes flutterwave_token for card updates)
+            metadata = {
+                'action': 'extend_subscription' if not is_advance_renewal else 'advance_renewal',
+                'subscription_id': str(subscription.id),
+                'periods': periods,
+                'new_plan_id': str(new_plan.id) if new_plan else None,
+                'tenant_id': str(tenant_id),
+            }
+
+            # ADD FLUTTERWAVE TOKEN IF PRESENT — THIS MAKES CARD CHANGE WORK
+            if flutterwave_token:
+                metadata['flutterwave_token'] = flutterwave_token
+
+            # Initialize payment
+            if provider == 'paystack':
+                from .payments import initiate_paystack_payment
+                from .utils import generate_confirm_token
+                confirm_token = generate_confirm_token(request.user, str(plan_for_calculation.id))
+
+                response = initiate_paystack_payment(
+                    confirm_token=confirm_token,
+                    amount=float(amount),
+                    user=request.user,
+                    plan_id=str(plan_for_calculation.id),
+                    tenant_id=str(tenant_id),
+                    tenant_name=getattr(request.user, 'tenant_name', None),
+                    metadata=metadata
                 )
 
-        except Exception as e:
-            print(f"CustomerPortalViewSet.change_subscription_card: Unexpected error - {str(e)}")
-            return Response({'error': 'Card change failed'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            elif provider == 'flutterwave':
+                from .payments import initiate_flutterwave_payment
+                from .utils import generate_confirm_token
+                confirm_token = generate_confirm_token(request.user, str(plan_for_calculation.id))
 
-    @action(detail=True, methods=['get'], url_path='payment-info')
-    @swagger_helper("Customer Portal", "get_payment_provider_info")
-    def get_payment_provider_info(self, request, pk=None):
+                response = initiate_flutterwave_payment(
+                    confirm_token=confirm_token,
+                    amount=float(amount),
+                    user=request.user,
+                    plan_id=str(plan_for_calculation.id),
+                    tenant_id=str(tenant_id),
+                    tenant_name=getattr(request.user, 'tenant_name', None),
+                    metadata=metadata  # ← Now includes flutterwave_token
+                )
+            else:
+                payment.delete()
+                return Response({'error': f'Unsupported payment provider: {provider}'},
+                              status=status.HTTP_400_BAD_REQUEST)
+
+            if response.status_code == 200:
+                response_data = response.data
+                extension_type = "advance renewal" if is_advance_renewal else "emergency extension"
+
+                return Response({
+                    'data': f'Payment initiated for subscription {extension_type}.',
+                    'payment_id': str(payment.id),
+                    'subscription_id': str(subscription.id),
+                    'payment_url': response_data.get('payment_link') or response_data.get('link'),
+                    'authorization_url': response_data.get('authorization_url'),
+                    'reference': response_data.get('tx_ref'),
+                    'amount': str(amount),
+                    'provider': provider,
+                    'periods': periods,
+                    'remaining_days_before': remaining_days,
+                    'extension_type': extension_type,
+                    'plan_change_scheduled': new_plan.name if new_plan else None,
+                    'message': f'Please complete payment to {"renew in advance" if is_advance_renewal else "extend"} your subscription'
+                })
+            else:
+                payment.delete()
+                error_data = response.data if hasattr(response, 'data') else {'error': 'Payment initialization failed'}
+                return Response(error_data, status=response.status_code)
+
+        except ValidationError as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            logger.error(f"Smart extension failed: {str(e)}", exc_info=True)
+            return Response({'error': 'Extension failed'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
+    @action(detail=False, methods=['get'], url_path='manage-payment-method')
+    @swagger_helper("Customer Portal", "get_manage_payment_method_link")
+    def manage_payment_method(self, request):
         """
-        Get information about the payment provider setup for this subscription.
+        Returns the correct URL for user to update their card.
+        Paystack: Hosted dashboard (best UX)
+        Flutterwave: Force new payment (only way)
+
+        Production-Ready Flow:
+        1. User calls this endpoint
+        2. Gets Paystack dashboard URL or Flutterwave re-payment instruction
+        3. User updates card on provider's platform
+        4. Provider sends webhook with new card details
+        5. Webhook automatically updates TenantBillingPreferences
         """
         try:
-            subscription = self.get_object()
-            subscription_service = SubscriptionService(request)
+            tenant_id = getattr(request.user, 'tenant', None)
+            if not tenant_id:
+                return Response({'error': 'No tenant associated with user'}, status=status.HTTP_403_FORBIDDEN)
 
-            # Get auto-renewal record
-            auto_renewal = AutoRenewal.objects.filter(
-                subscription=subscription,
-                status='active'
-            ).first()
-
-            if not auto_renewal:
+            prefs = TenantBillingPreferences.objects.filter(tenant_id=tenant_id).first()
+            if not prefs or not prefs.payment_provider:
                 return Response({
-                    'subscription_id': str(subscription.id),
+                    "error": "No payment method found. Please complete your first payment."
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            if prefs.payment_provider == "paystack":
+                if prefs.paystack_subscription_code:
+                    manage_url = f"https://paystack.com/my-subscriptions/{prefs.paystack_subscription_code}"
+                    return Response({
+                        "provider": "paystack",
+                        "action": "redirect_to_dashboard",
+                        "manage_url": manage_url,
+                        "message": "Update your card on Paystack's secure dashboard"
+                    })
+                else:
+                    # Fallback: force new payment
+                    return Response({
+                        "provider": "paystack",
+                        "action": "new_payment_required",
+                        "message": "Please make a new payment to update your desired card"
+                    })
+
+            elif prefs.payment_provider == "flutterwave":
+                return Response({
+                    "provider": "flutterwave",
+                    "action": "new_payment_required",
+                    "message": "Please make any payment (even ₦100) with your new card to update it"
+                })
+
+        except Exception as e:
+            logger.error(f"manage_payment_method error: {e}")
+            return Response({"error": "Failed to generate payment update link"}, status=500)
+
+    @action(detail=False, methods=['get'], url_path='payment-info')
+    @swagger_helper("Customer Portal", "get_payment_provider_info")
+    def get_payment_provider_info(self, request):
+        """
+        Get comprehensive payment provider information for the tenant.
+        This endpoint provides details about current payment methods and billing setup.
+
+        Data Flow:
+        1. Retrieves TenantBillingPreferences for the tenant
+        2. Gets last payment information from Payment model
+        3. Returns payment method details, card info, and renewal status
+
+        Outcomes:
+        - Returns current payment provider (Paystack/Flutterwave)
+        - Shows card details (last4, brand) if available
+        - Displays auto-renewal status
+        - Shows last payment information
+        - Provides next renewal date if scheduled
+
+        Use Case:
+        - Users checking their current payment setup
+        - Frontend displaying payment method in UI
+        - Troubleshooting payment issues
+        """
+        try:
+            tenant_id = getattr(request.user, 'tenant', None)
+            if not tenant_id:
+                return Response({'error': 'No tenant associated with user'}, status=status.HTTP_403_FORBIDDEN)
+
+            # Get tenant billing preferences
+            preferences = TenantBillingPreferences.objects.filter(tenant_id=tenant_id).first()
+
+            if not preferences:
+                return Response({
                     'auto_renewal': False,
                     'payment_provider': None,
-                    'message': 'No active auto-renewal found'
+                    'message': 'No billing preferences configured'
                 })
 
-            # Extract payment provider information
-            provider_info = subscription_service._extract_payment_provider_info(auto_renewal)
-
-            # Get last payment information
-            last_payment = subscription.payments.filter(status='completed').order_by('-payment_date').first()
-
-            payment_details = None
-            if last_payment:
-                payment_details = {
-                    'provider': last_payment.provider,
-                    'amount': str(last_payment.amount),
-                    'date': last_payment.payment_date.isoformat(),
-                    'transaction_id': last_payment.transaction_id
-                }
+            # Get subscription for last payment info
+            subscription = Subscription.objects.filter(tenant_id=tenant_id).first()
+            last_payment = None
+            if subscription:
+                last_payment = subscription.payments.filter(status='completed').order_by('-payment_date').first()
+                if last_payment:
+                    last_payment = {
+                        'provider': last_payment.provider,
+                        'amount': str(last_payment.amount),
+                        'date': last_payment.payment_date.isoformat(),
+                        'transaction_id': last_payment.transaction_id
+                    }
 
             return Response({
-                'subscription_id': str(subscription.id),
-                'auto_renewal': True,
-                'payment_provider': provider_info.get('provider'),
-                'provider_details': provider_info,
-                'last_payment': payment_details,
-                'auto_renewal_status': auto_renewal.status,
-                'next_renewal_date': auto_renewal.next_renewal_date.isoformat() if auto_renewal.next_renewal_date else None
+                'auto_renewal': preferences.auto_renew_enabled,
+                'payment_provider': preferences.payment_provider,
+                'card_info': {
+                    'last4': preferences.card_last4,
+                    'brand': preferences.card_brand,
+                    'email': preferences.payment_email
+                } if preferences.card_last4 else None,
+                'last_payment': last_payment,
+                'next_renewal_date': preferences.next_renewal_date.isoformat() if preferences.next_renewal_date else None,
+                'preferred_plan': str(preferences.preferred_plan.id) if preferences.preferred_plan else None
             })
 
         except Exception as e:
             print(f"CustomerPortalViewSet.get_payment_provider_info: Unexpected error - {str(e)}")
             return Response({'error': 'Failed to retrieve payment info'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-    @action(detail=True, methods=['post'], url_path='update-payment-method')
-    def update_payment_method(self, request, pk=None):
-        """
-        Endpoint to initiate update of payment card for recurring billing.
-        If Paystack: returns a manage link (hosted), if Flutterwave: triggers frontend re-entry of card.
-        """
-        try:
-            subscription = self.get_object()
-            token = getattr(subscription, 'recurring_token', None)
-            if not token:
-                return Response({"error": "No recurring token/payment method on file. Make first payment."}, status=400)
 
-            if token.provider == "paystack":
-                if token.paystack_subscription_code:
-                    url = f'https://dashboard.paystack.com/#/subscriptions/{token.paystack_subscription_code}'
-                    return Response({"provider": "paystack", "update_url": url})
-                else:
-                    return Response({"error": "No Paystack subscription code available for manage link."}, status=400)
-            elif token.provider == "flutterwave":
-                return Response({"provider": "flutterwave", "update_card_flow": True})
 
-            return Response({"error": "Unknown payment provider."}, status=400)
-        except Exception as e:
-            return Response({"error": str(e)}, status=500)
+
+
+
+
+

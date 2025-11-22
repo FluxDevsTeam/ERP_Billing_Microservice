@@ -7,6 +7,7 @@ from apps.billing.utils import IdentityServiceClient
 class InitiateSerializer(serializers.Serializer):
     plan_id = serializers.PrimaryKeyRelatedField(queryset=Plan.objects.all())
     provider = serializers.ChoiceField(choices=['paystack', 'flutterwave'])
+    auto_renew = serializers.BooleanField(default=False, required=False)
 
 
 class PaymentSerializer(serializers.ModelSerializer):

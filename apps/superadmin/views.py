@@ -5,7 +5,7 @@ from rest_framework.response import Response
 from django.utils import timezone
 from django.db.models import Sum, Count, F, Q
 from django.db.models.functions import TruncMonth, TruncDay
-from apps.billing.models import Subscription, AuditLog, Plan, AutoRenewal
+from apps.billing.models import Subscription, AuditLog, Plan
 from apps.payment.models import Payment, WebhookEvent
 from apps.payment.services import PaymentService
 from apps.billing.serializers import SubscriptionSerializer, AuditLogSerializer, PlanSerializer

@@ -125,21 +125,13 @@ class Subscription(models.Model):
     updated_at = models.DateTimeField(auto_now=True)
     suspended_at = models.DateTimeField(null=True, blank=True)
     canceled_at = models.DateTimeField(null=True, blank=True)
-    auto_renew = models.BooleanField(default=True)
     trial_end_date = models.DateTimeField(null=True, blank=True)
-    last_payment_date = models.DateTimeField(null=True, blank=True)
-    next_payment_date = models.DateTimeField(null=True, blank=True)
-    payment_retry_count = models.IntegerField(default=0)
-    max_payment_retries = models.IntegerField(default=3)
-    is_first_time_subscription = models.BooleanField(default=True)
-    trial_used = models.BooleanField(default=False)
 
     class Meta:
         indexes = [
             models.Index(fields=['tenant_id', 'status']),
             models.Index(fields=['status', 'end_date']),
             models.Index(fields=['tenant_id', 'end_date']),
-            models.Index(fields=['auto_renew', 'status']),
         ]
 
     def calculate_end_date(self, start_date):
@@ -187,17 +179,16 @@ class Subscription(models.Model):
         return False
 
     def can_be_renewed(self):
-        """Check if subscription can be renewed (either via auto_renew field for backwards compatibility or via AutoRenewal)"""
+        """Check if subscription can be renewed via TenantBillingPreferences"""
         if self.status not in ['active', 'expired']:
             return False
-        
-        # Check if there's an active AutoRenewal
-        active_auto_renewal = self.auto_renewals.filter(status='active').first()
-        if active_auto_renewal:
+
+        # Check TenantBillingPreferences for renewal settings
+        billing_prefs = self.tenant_billing_preferences
+        if billing_prefs and billing_prefs.auto_renew_enabled and billing_prefs.renewal_status == 'active':
             return True
-        
-        # Fallback to auto_renew field for backwards compatibility
-        return self.auto_renew
+
+        return False
 
     def get_remaining_days(self):
         if self.status == 'active':
@@ -211,70 +202,16 @@ class Subscription(models.Model):
         else:
             return 0
 
+    @property
+    def tenant_billing_preferences(self):
+        """Get tenant's billing preferences (cached property for performance)"""
+        try:
+            return TenantBillingPreferences.objects.get(tenant_id=self.tenant_id)
+        except TenantBillingPreferences.DoesNotExist:
+            return None
+
     def __str__(self):
         return f"Subscription for Tenant {self.tenant_id} - {self.plan.name}"
-
-
-class AutoRenewal(models.Model):
-    """Model to handle auto-renewal of subscriptions"""
-    STATUS_CHOICES = (
-        ('active', 'Active'),
-        ('paused', 'Paused'),
-        ('canceled', 'Canceled'),
-        ('processing', 'Processing'),
-        ('failed', 'Failed'),
-    )
-
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    tenant_id = models.UUIDField(help_text="Tenant identifier for the subscription", db_index=True)
-    user_id = models.CharField(max_length=255, null=True, blank=True, help_text="User identifier who set up the auto-renewal")
-    subscription = models.ForeignKey(Subscription, on_delete=models.CASCADE, related_name='auto_renewals', null=True, blank=True, help_text="Optional reference to subscription")
-    plan = models.ForeignKey(Plan, on_delete=models.SET_NULL, null=True, related_name='auto_renewals', help_text="Plan to renew to")
-    expiry_date = models.DateTimeField(help_text="Date when the current subscription period expires", db_index=True)
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='active', db_index=True)
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
-    last_renewal_at = models.DateTimeField(null=True, blank=True, help_text="Last successful renewal timestamp")
-    next_renewal_date = models.DateTimeField(null=True, blank=True, help_text="Next scheduled renewal date", db_index=True)
-    failure_count = models.IntegerField(default=0, help_text="Number of consecutive renewal failures")
-    max_failures = models.IntegerField(default=3, help_text="Maximum allowed failures before auto-pause")
-    notes = models.TextField(blank=True, help_text="Additional notes about the auto-renewal")
-
-    class Meta:
-        unique_together = [('tenant_id', 'plan')]
-        ordering = ['expiry_date']
-        indexes = [
-            models.Index(fields=['tenant_id', 'status']),
-            models.Index(fields=['expiry_date', 'status']),
-            models.Index(fields=['status', 'next_renewal_date']),
-            models.Index(fields=['tenant_id', 'expiry_date']),
-        ]
-
-    def __str__(self):
-        return f"AutoRenewal for Tenant {self.tenant_id} - {self.plan.name if self.plan else 'No Plan'}"
-
-    def is_due_for_renewal(self):
-        """Check if the auto-renewal is due"""
-        if self.status != 'active':
-            return False
-        if not self.next_renewal_date:
-            # If no next_renewal_date set, use expiry_date
-            return timezone.now() >= self.expiry_date
-        return timezone.now() >= self.next_renewal_date
-
-    def can_renew(self):
-        """Check if the auto-renewal can be processed"""
-        if self.status != 'active':
-            return False, f"Auto-renewal status is {self.status}"
-        if self.failure_count >= self.max_failures:
-            return False, f"Maximum failure count ({self.max_failures}) reached"
-        if not self.plan:
-            return False, "No plan associated with auto-renewal"
-        if self.plan.discontinued:
-            return False, "Plan is discontinued"
-        if not self.plan.is_active:
-            return False, "Plan is not active"
-        return True, "OK"
 
 
 class SubscriptionCredit(models.Model):
@@ -305,7 +242,7 @@ class TrialUsage(models.Model):
         # Only enforce uniqueness when machine_number is not null
         constraints = [
             models.UniqueConstraint(
-                fields=['machine_number'], 
+                fields=['machine_number'],
                 name='unique_machine_trial',
                 condition=models.Q(machine_number__isnull=False)
             ),
@@ -320,29 +257,146 @@ class TrialUsage(models.Model):
         return f"Trial for Tenant {self.tenant_id} - {self.user_email}{machine_info}"
 
 
-class RecurringToken(models.Model):
-    """Model to store recurring payment tokens for subscriptions"""
+class TenantBillingPreferences(models.Model):
+    """
+    COMPLETE TENANT BILLING MANAGEMENT: Consolidated billing preferences, payment methods, and renewal logic.
+    One record per tenant - no duplicates, just update existing record.
+    Handles all auto-renewal, payment method storage, and billing preferences.
+    """
     PROVIDER_CHOICES = (
         ('paystack', 'Paystack'),
         ('flutterwave', 'Flutterwave'),
     )
 
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    subscription = models.OneToOneField(Subscription, on_delete=models.CASCADE, related_name='recurring_token')
-    provider = models.CharField(max_length=20, choices=PROVIDER_CHOICES)
-    paystack_subscription_code = models.CharField(max_length=255, null=True, blank=True, help_text="Paystack subscription code for managing recurring payments")
-    last4 = models.CharField(max_length=4, null=True, blank=True, help_text="Last 4 digits of card")
+    STATUS_CHOICES = (
+        ('active', 'Active'),
+        ('paused', 'Paused'),
+        ('canceled', 'Canceled'),
+        ('processing', 'Processing'),
+        ('failed', 'Failed'),
+    )
+
+    tenant_id = models.UUIDField(primary_key=True, help_text="Tenant identifier - unique per tenant")
+    user_id = models.CharField(max_length=255, null=True, blank=True, help_text="User who manages billing preferences")
+
+    # Auto-renewal settings (consolidated from AutoRenewal model)
+    auto_renew_enabled = models.BooleanField(default=True, help_text="Whether auto-renewal is enabled")
+    renewal_status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='active',
+                                    help_text="Current renewal status")
+    preferred_plan = models.ForeignKey(Plan, on_delete=models.SET_NULL, null=True, blank=True,
+                                     help_text="Plan to renew to (defaults to current plan)")
+    subscription_expiry_date = models.DateTimeField(null=True, blank=True,
+                                                  help_text="Date when current subscription expires")
+    next_renewal_date = models.DateTimeField(null=True, blank=True, help_text="Next scheduled renewal date")
+    renewal_failure_count = models.IntegerField(default=0, help_text="Consecutive renewal failures")
+    max_renewal_failures = models.IntegerField(default=3, help_text="Max failures before auto-disable")
+    last_renewal_attempt = models.DateTimeField(null=True, blank=True, help_text="Last renewal attempt timestamp")
+
+    # Payment method details (consolidated from RecurringToken model)
+    payment_provider = models.CharField(max_length=20, choices=PROVIDER_CHOICES, null=True, blank=True)
+    paystack_subscription_code = models.CharField(max_length=255, null=True, blank=True,
+                                                help_text="Paystack subscription code for recurring payments")
+    paystack_authorization_code = models.CharField(max_length=255, null=True, blank=True,
+                                                 help_text="Reusable authorization code for charging saved card (Paystack)")
+    paystack_customer_code = models.CharField(max_length=255, null=True, blank=True,
+                                            help_text="Paystack customer identifier")
+    flutterwave_payment_method_id = models.CharField(max_length=255, null=True, blank=True,
+                                                    help_text="Flutterwave payment method ID")
+    flutterwave_customer_id = models.CharField(max_length=255, null=True, blank=True,
+                                              help_text="Flutterwave customer ID")
+    card_last4 = models.CharField(max_length=4, null=True, blank=True, help_text="Last 4 digits of card")
     card_brand = models.CharField(max_length=50, null=True, blank=True, help_text="Card brand (Visa, Mastercard, etc.)")
-    email = models.EmailField(null=True, blank=True, help_text="Email associated with payment method")
-    is_active = models.BooleanField(default=True)
+    payment_email = models.EmailField(null=True, blank=True, help_text="Email associated with payment method")
+
+    # Metadata
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+    last_payment_at = models.DateTimeField(null=True, blank=True, help_text="Last successful payment timestamp")
+    notes = models.TextField(blank=True, help_text="Additional billing notes")
 
     class Meta:
         indexes = [
-            models.Index(fields=['provider', 'is_active']),
-            models.Index(fields=['subscription', 'is_active']),
+            models.Index(fields=['auto_renew_enabled', 'next_renewal_date']),
+            models.Index(fields=['tenant_id', 'auto_renew_enabled']),
+            models.Index(fields=['renewal_status', 'next_renewal_date']),
+            models.Index(fields=['payment_provider', 'paystack_subscription_code']),
+            models.Index(fields=['subscription_expiry_date', 'renewal_status']),
         ]
 
     def __str__(self):
-        return f"{self.provider} token for {self.subscription.tenant_id} - {self.last4 or 'N/A'}"
+        return f"Billing Preferences for Tenant {self.tenant_id}"
+
+    def is_due_for_renewal(self):
+        """Check if tenant's subscription is due for renewal"""
+        if not self.auto_renew_enabled or self.renewal_status != 'active':
+            return False
+        if not self.next_renewal_date:
+            # If no next_renewal_date set, use subscription_expiry_date
+            return timezone.now() >= (self.subscription_expiry_date or timezone.now())
+        return timezone.now() >= self.next_renewal_date
+
+    def can_renew(self):
+        """Check if renewal can be processed"""
+        if not self.auto_renew_enabled or self.renewal_status != 'active':
+            return False, f"Auto-renewal is disabled or status is {self.renewal_status}"
+
+        if self.renewal_failure_count >= self.max_renewal_failures:
+            return False, f"Maximum failure count ({self.max_renewal_failures}) reached"
+
+        if not self.payment_provider:
+            return False, "No payment method configured"
+
+        if not self.preferred_plan:
+            return False, "No preferred plan set for renewal"
+
+        if self.preferred_plan.discontinued or not self.preferred_plan.is_active:
+            return False, "Preferred plan is not available"
+
+        return True, "OK"
+
+    def record_renewal_success(self):
+        """Update after successful renewal"""
+        self.last_payment_at = timezone.now()
+        self.last_renewal_attempt = timezone.now()
+        self.renewal_failure_count = 0
+        self.renewal_status = 'active'
+        # next_renewal_date will be set by renewal logic
+        self.save()
+
+    def record_renewal_failure(self):
+        """Update after failed renewal"""
+        self.renewal_failure_count += 1
+        self.last_renewal_attempt = timezone.now()
+        if self.renewal_failure_count >= self.max_renewal_failures:
+            self.renewal_status = 'failed'
+            self.auto_renew_enabled = False  # Auto-disable after max failures
+        self.save()
+
+    def update_payment_method(self, provider, **payment_data):
+        """Update payment method details"""
+        self.payment_provider = provider
+        if provider == 'paystack':
+            self.paystack_subscription_code = payment_data.get('subscription_code')
+        elif provider == 'flutterwave':
+            self.flutterwave_payment_method_id = payment_data.get('payment_method_id')
+            self.flutterwave_customer_id = payment_data.get('customer_id')
+
+        self.card_last4 = payment_data.get('last4')
+        self.card_brand = payment_data.get('card_brand')
+        self.payment_email = payment_data.get('email')
+        self.save()
+
+    def get_payment_method_info(self):
+        """Get formatted payment method information"""
+        if not self.payment_provider:
+            return None
+
+        return {
+            'provider': self.payment_provider,
+            'card_last4': self.card_last4,
+            'card_brand': self.card_brand,
+            'email': self.payment_email,
+            'paystack_subscription_code': self.paystack_subscription_code,
+            'flutterwave_payment_method_id': self.flutterwave_payment_method_id,
+            'flutterwave_customer_id': self.flutterwave_customer_id,
+        }

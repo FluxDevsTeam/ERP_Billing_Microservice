@@ -12,7 +12,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-from .models import Plan, Subscription, AuditLog, AutoRenewal, RecurringToken
+from .models import Plan, Subscription, AuditLog, TenantBillingPreferences
 from apps.payment.models import Payment
 from .serializers import (
     SubscriptionSerializer, PaymentSerializer,
@@ -21,7 +21,7 @@ from .serializers import (
 )
 from .permissions import IsSuperuser, IsCEOorSuperuser, CanViewEditSubscription
 from .utils import IdentityServiceClient, swagger_helper
-from .services import SubscriptionService, AutoRenewalService
+from .services import SubscriptionService
 from api.email_service import send_email_via_service
 
 
@@ -91,20 +91,25 @@ class SubscriptionView(viewsets.ModelViewSet):
                 is_trial=is_trial
             )
 
-            # Create auto-renewal if auto_renew is True (default)
+            # Create/update tenant billing preferences
             auto_renew = serializer.validated_data.get('auto_renew', True)
-            if auto_renew:
-                try:
-                    auto_renewal_service = AutoRenewalService(request)
-                    auto_renewal_service.create_auto_renewal(
-                        tenant_id=str(tenant_id),
-                        plan_id=str(plan_id),
-                        expiry_date=subscription.end_date,
-                        user_id=str(request.user.id),
-                        subscription_id=str(subscription.id)
-                    )
-                except Exception as e:
-                    logger.warning(f"Failed to create auto-renewal for subscription {subscription.id}: {str(e)}")
+            preferences, created = TenantBillingPreferences.objects.get_or_create(
+                tenant_id=tenant_id,
+                defaults={
+                    'user_id': str(request.user.id),
+                    'auto_renew_enabled': auto_renew,
+                    'preferred_plan_id': plan_id,
+                    'subscription_expiry_date': subscription.end_date,
+                    'next_renewal_date': subscription.end_date if auto_renew else None,
+                }
+            )
+            if not created:
+                # Update existing preferences
+                preferences.auto_renew_enabled = auto_renew
+                preferences.preferred_plan_id = plan_id
+                preferences.subscription_expiry_date = subscription.end_date
+                preferences.next_renewal_date = subscription.end_date if auto_renew else None
+                preferences.save()
 
             # Send welcome email
             email_data = {

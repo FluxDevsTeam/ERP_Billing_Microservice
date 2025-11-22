@@ -78,8 +78,8 @@ class AccessCheckView(viewsets.ViewSet):
                 "expires_on": subscription.end_date.isoformat() if subscription.end_date else None,
                 "remaining_days": subscription.get_remaining_days(),
                 "in_grace_period": subscription.is_in_grace_period(),
-                "auto_renew": subscription.auto_renew,  # Backwards compatibility
-                "auto_renewal_active": subscription.auto_renewals.filter(status='active').exists(),
+                "auto_renew": subscription.tenant_billing_preferences.auto_renew_enabled if subscription.tenant_billing_preferences else False,  # Backwards compatibility
+                "auto_renewal_active": subscription.tenant_billing_preferences.renewal_status == 'active' if subscription.tenant_billing_preferences else False,
                 "timestamp": timezone.now().isoformat()
             }
 

@@ -1,7 +1,7 @@
 # apps/billing/serializers.py
 from rest_framework import serializers
 from django.utils import timezone
-from .models import Plan, Subscription, AuditLog, TrialUsage, AutoRenewal, RecurringToken
+from .models import Plan, Subscription, AuditLog, TrialUsage, TenantBillingPreferences
 from apps.payment.models import Payment
 import logging
 from .period_calculator import PeriodCalculator
@@ -25,19 +25,22 @@ class PlanSerializer(serializers.ModelSerializer):
         return PeriodCalculator.get_period_display(obj.billing_period)
 
 
-class RecurringTokenSerializer(serializers.ModelSerializer):
+class TenantBillingPreferencesSerializer(serializers.ModelSerializer):
     class Meta:
-        model = RecurringToken
+        model = TenantBillingPreferences
         fields = [
-            'provider', 'last4', 'card_brand', 'email', 'is_active', 'created_at', 'updated_at'
+            'tenant_id', 'auto_renew_enabled', 'renewal_status', 'preferred_plan',
+            'subscription_expiry_date', 'next_renewal_date', 'renewal_failure_count',
+            'payment_provider', 'card_last4', 'card_brand', 'payment_email',
+            'last_payment_at', 'created_at', 'updated_at'
         ]
-        read_only_fields = fields
+        read_only_fields = ['tenant_id', 'created_at', 'updated_at']
 
 
 class SubscriptionSerializer(serializers.ModelSerializer):
     plan = PlanSerializer(read_only=True)
     scheduled_plan = PlanSerializer(read_only=True)
-    recurring_token = RecurringTokenSerializer(read_only=True)
+    billing_preferences = TenantBillingPreferencesSerializer(read_only=True, source='tenant_billing_preferences')
     remaining_days = serializers.SerializerMethodField()
     in_grace_period = serializers.SerializerMethodField()
     billing_period_display = serializers.SerializerMethodField()
@@ -47,16 +50,14 @@ class SubscriptionSerializer(serializers.ModelSerializer):
         model = Subscription
         fields = [
             'id', 'tenant_id', 'plan', 'scheduled_plan', 'status', 'start_date', 'end_date',
-            'created_at', 'updated_at', 'suspended_at', 'canceled_at', 'auto_renew',
-            'trial_end_date', 'last_payment_date', 'next_payment_date',
-            'payment_retry_count', 'max_payment_retries', 'remaining_days', 'in_grace_period',
-            'is_first_time_subscription', 'trial_used', 'billing_period_display',
-            'recurring_token', 'payment_method_update_url'
+            'created_at', 'updated_at', 'suspended_at', 'canceled_at',
+            'trial_end_date', 'remaining_days', 'in_grace_period', 'billing_period_display',
+            'billing_preferences', 'payment_method_update_url'
         ]
         read_only_fields = [
             'status', 'start_date', 'end_date', 'created_at', 'updated_at',
-            'suspended_at', 'canceled_at', 'last_payment_date', 'next_payment_date',
-            'payment_retry_count', 'remaining_days', 'in_grace_period', 'recurring_token', 'payment_method_update_url'
+            'suspended_at', 'canceled_at', 'remaining_days', 'in_grace_period',
+            'billing_preferences', 'payment_method_update_url'
         ]
 
     def get_billing_period_display(self, obj):
@@ -69,13 +70,14 @@ class SubscriptionSerializer(serializers.ModelSerializer):
         return obj.is_in_grace_period()
 
     def get_payment_method_update_url(self, obj):
-        token = getattr(obj, 'recurring_token', None)
-        if not token:
-            return None
-        if token.provider == 'paystack' and token.paystack_subscription_code:
-            return f'https://dashboard.paystack.com/#/subscriptions/{token.paystack_subscription_code}'
-        elif token.provider == 'flutterwave':
-            return None  # Frontend should trigger update card pay flow
+        try:
+            preferences = TenantBillingPreferences.objects.get(tenant_id=obj.tenant_id)
+            if preferences.payment_provider == 'paystack' and preferences.paystack_subscription_code:
+                return f'https://dashboard.paystack.com/#/subscriptions/{preferences.paystack_subscription_code}'
+            elif preferences.payment_provider == 'flutterwave':
+                return None  # Frontend should trigger update card pay flow
+        except TenantBillingPreferences.DoesNotExist:
+            pass
         return None
 
 
@@ -270,87 +272,19 @@ class PaymentSerializer(serializers.ModelSerializer):
         read_only_fields = ['amount', 'payment_date', 'transaction_id', 'status', 'provider', 'payment_type']
 
 
-class AutoRenewalSerializer(serializers.ModelSerializer):
-    plan = PlanSerializer(read_only=True)
-    plan_id = serializers.UUIDField(write_only=True, required=False)
-    subscription_id = serializers.UUIDField(write_only=True, required=False)
+class TenantBillingPreferencesUpdateSerializer(serializers.Serializer):
+    auto_renew_enabled = serializers.BooleanField(required=False)
+    preferred_plan_id = serializers.UUIDField(required=False)
 
-    class Meta:
-        model = AutoRenewal
-        fields = [
-            'id', 'tenant_id', 'user_id', 'subscription', 'subscription_id', 'plan', 'plan_id',
-            'expiry_date', 'status', 'created_at', 'updated_at', 'last_renewal_at',
-            'next_renewal_date', 'failure_count', 'max_failures', 'notes'
-        ]
-        read_only_fields = [
-            'id', 'created_at', 'updated_at', 'last_renewal_at', 'failure_count'
-        ]
-
-    def validate_plan_id(self, value):
+    def validate_preferred_plan_id(self, value):
         if value:
             try:
                 plan = Plan.objects.get(id=value)
                 if not plan.is_active or plan.discontinued:
-                    logger.warning(f"Auto-renewal creation failed: Plan {value} is not available")
+                    logger.warning(f"Billing preferences update failed: Plan {value} is not available")
                     raise serializers.ValidationError("Plan is not available")
                 return value
             except Plan.DoesNotExist:
-                logger.error(f"Auto-renewal creation failed: Plan {value} does not exist")
-                raise serializers.ValidationError("Plan does not exist")
-        return None
-
-
-class AutoRenewalCreateSerializer(serializers.Serializer):
-    plan_id = serializers.UUIDField()
-    expiry_date = serializers.DateTimeField()
-    subscription_id = serializers.UUIDField(required=False)
-
-    def validate(self, data):
-        user = self.context['request'].user
-        tenant_id = getattr(user, 'tenant', None)
-        if not tenant_id:
-            logger.warning(f"Auto-renewal creation failed: No tenant_id associated with user {user.email}")
-            raise serializers.ValidationError("No tenant associated with user")
-
-        # Validate plan
-        plan_id = data['plan_id']
-        try:
-            plan = Plan.objects.get(id=plan_id)
-            if not plan.is_active or plan.discontinued:
-                logger.warning(f"Auto-renewal creation failed: Plan {plan_id} is not available")
-                raise serializers.ValidationError("Plan is not available")
-        except Plan.DoesNotExist:
-            logger.error(f"Auto-renewal creation failed: Plan {plan_id} does not exist")
-            raise serializers.ValidationError("Plan does not exist")
-
-        # Validate subscription if provided
-        subscription_id = data.get('subscription_id')
-        if subscription_id:
-            try:
-                subscription = Subscription.objects.get(id=subscription_id)
-                if str(subscription.tenant_id) != str(tenant_id):
-                    raise serializers.ValidationError("Subscription does not belong to tenant")
-            except Subscription.DoesNotExist:
-                logger.error(f"Auto-renewal creation failed: Subscription {subscription_id} does not exist")
-                raise serializers.ValidationError("Subscription does not exist")
-
-        data['tenant_id'] = tenant_id
-        return data
-
-
-class AutoRenewalUpdateSerializer(serializers.Serializer):
-    plan_id = serializers.UUIDField(required=False)
-    status = serializers.ChoiceField(choices=AutoRenewal.STATUS_CHOICES, required=False)
-
-    def validate_plan_id(self, value):
-        if value:
-            try:
-                plan = Plan.objects.get(id=value)
-                if not plan.is_active or plan.discontinued:
-                    logger.warning(f"Auto-renewal update failed: Plan {value} is not available")
-                    raise serializers.ValidationError("Plan is not available")
-                return value
-            except Plan.DoesNotExist:
-                logger.error(f"Auto-renewal update failed: Plan {value} does not exist")
+                logger.error(f"Billing preferences update failed: Plan {value} does not exist")
                 raise serializers.ValidationError("Plan does not exist")
         return None

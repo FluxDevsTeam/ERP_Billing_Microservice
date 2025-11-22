@@ -4,7 +4,7 @@ from .views_plan import PlanView
 from .views_subscription import SubscriptionView
 from .views_access import AccessCheckView
 from .views_customer_portal import CustomerPortalViewSet
-from .views_auto_renewal import AutoRenewalViewSet
+from .views_webhook import payment_webhook
 from .health_views import SystemHealthView
 
 urlpatterns = [
@@ -24,24 +24,13 @@ urlpatterns = [
     # CustomerPortalViewSet
     path('customer-portal/details/', CustomerPortalViewSet.as_view({'get': 'get_subscription_details'}), name='customer_portal_details'),
     path('customer-portal/change-plan/', CustomerPortalViewSet.as_view({'post': 'change_plan'}), name='customer_portal_change_plan'),
-    path('customer-portal/advance-renewal/', CustomerPortalViewSet.as_view({'post': 'advance_renewal'}), name='customer_portal_advance_renewal'),
-    path('customer-portal/extend/', CustomerPortalViewSet.as_view({'post': 'extend_subscription'}), name='customer_portal_extend'),
     path('customer-portal/toggle-auto-renew/', CustomerPortalViewSet.as_view({'post': 'toggle_auto_renew'}), name='customer_portal_toggle_auto_renew'),
-    path('customer-portal/subscriptions/<uuid:pk>/renew/', CustomerPortalViewSet.as_view({'post': 'renew_subscription'}), name='subscription_renew'),
-    path('customer-portal/subscriptions/<uuid:pk>/change-plan/', CustomerPortalViewSet.as_view({'post': 'change_plan'}), name='subscription_change_plan'),
-    path('customer-portal/subscriptions/<uuid:pk>/advance-renewal/', CustomerPortalViewSet.as_view({'post': 'advance_renewal'}), name='subscription_advance_renewal'),
-    path('customer-portal/subscriptions/<uuid:pk>/extend/', CustomerPortalViewSet.as_view({'post': 'extend_subscription'}), name='subscription_extend'),
-    path('customer-portal/subscriptions/<uuid:pk>/toggle-auto-renew/', CustomerPortalViewSet.as_view({'post': 'toggle_auto_renew'}), name='subscription_toggle_auto_renew'),
-    path('customer-portal/subscriptions/<uuid:pk>/change-card/', CustomerPortalViewSet.as_view({'post': 'change_subscription_card'}), name='subscription_change_card'),
-    path('customer-portal/subscriptions/<uuid:pk>/payment-info/', CustomerPortalViewSet.as_view({'get': 'get_payment_provider_info'}), name='subscription_payment_info'),
-    path('customer-portal/subscriptions/<uuid:pk>/update-payment-method/', CustomerPortalViewSet.as_view({'post': 'update_payment_method'}), name='subscription_update_payment_method'),
+    path('customer-portal/extend/', CustomerPortalViewSet.as_view({'post': 'extend'}), name='customer_portal_extend'),
+    path('customer-portal/manage-payment-method/', CustomerPortalViewSet.as_view({'get': 'manage_payment_method'}), name='customer_portal_manage_payment_method'),
+    path('customer-portal/payment-info/', CustomerPortalViewSet.as_view({'get': 'get_payment_provider_info'}), name='customer_portal_payment_info'),
 
-    # AutoRenewalViewSet
-    path('auto-renewals/', AutoRenewalViewSet.as_view({'get': 'list', 'post': 'create'}), name='auto_renewal_list_create'),
-    path('auto-renewals/<uuid:pk>/', AutoRenewalViewSet.as_view({'get': 'retrieve', 'put': 'update', 'patch': 'partial_update', 'delete': 'destroy'}), name='auto_renewal_detail'),
-    path('auto-renewals/<uuid:pk>/process/', AutoRenewalViewSet.as_view({'post': 'process_renewal'}), name='auto_renewal_process'),
-    path('auto-renewals/<uuid:pk>/cancel/', AutoRenewalViewSet.as_view({'post': 'cancel_renewal'}), name='auto_renewal_cancel'),
-    path('auto-renewals/process-due/', AutoRenewalViewSet.as_view({'post': 'process_due_renewals'}), name='auto_renewal_process_due'),
+    # Webhooks
+    path('webhooks/payment/', payment_webhook, name='payment_webhook'),
 
     # AccessCheckView
     path('access-check/', AccessCheckView.as_view({'get': 'list'}), name='access_check'),

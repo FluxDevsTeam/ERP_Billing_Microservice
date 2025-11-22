@@ -14,7 +14,7 @@ from rest_framework_simplejwt.tokens import AccessToken
 
 from apps.billing.serializers import SubscriptionSerializer
 from .models import Payment
-from apps.billing.models import Subscription, Plan, RecurringToken
+from apps.billing.models import Subscription, Plan
 from .permissions import CanInitiatePayment
 from .serializers import PaymentSerializer, InitiateSerializer, PaymentSummaryInputSerializer
 from .payments import initiate_flutterwave_payment, initiate_paystack_payment
@@ -178,6 +178,7 @@ class PaymentInitiateViewSet(viewsets.ModelViewSet):
                 return Response({"error": "plan is discontinued"}, status=status.HTTP_423_LOCKED)
 
             provider = serializer.validated_data['provider']
+            auto_renew = serializer.validated_data.get('auto_renew', False)
             amount = plan.price
             tenant_id = getattr(request.user, 'tenant', None)
             tenant_name = getattr(request.user, 'tenant_name', None)
@@ -225,12 +226,15 @@ class PaymentInitiateViewSet(viewsets.ModelViewSet):
                 status='pending',
                 provider=provider
             )
+            # Prepare metadata with auto_renew status
+            metadata = {"auto_renew": auto_renew}
+
             if provider == "flutterwave":
                 response = initiate_flutterwave_payment(token, amount, request.user, str(plan.id), str(tenant_id),
-                                                        tenant_name)
+                                                        tenant_name, metadata)
             elif provider == "paystack":
                 response = initiate_paystack_payment(token, amount, request.user, str(plan.id), str(tenant_id),
-                                                     tenant_name)
+                                                      tenant_name, metadata)
             else:
                 return Response({"error": "Invalid payment provider"}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -276,6 +280,7 @@ class PaymentVerifyViewSet(viewsets.ViewSet):
             plan_id_param = request.query_params.get("plan_id")
             tenant_id_param = request.query_params.get("tenant_id")
             transaction_id = request.query_params.get("transaction_id") or tx_ref
+            auto_renew = request.query_params.get("auto_renew", "false").lower() == "true"
 
             if not all([tx_ref, amount, provider, token, plan_id_param, tenant_id_param]):
                 return redirect("https://example.com/payment-failed/?data=Invalid-request-parameters")
@@ -410,14 +415,28 @@ class PaymentVerifyViewSet(viewsets.ViewSet):
                         tenant_id=str(tenant_uuid),
                         plan_id=str(plan.id),
                         user=str(user.id) if user else 'system',
-                        is_trial=False
+                        is_trial=False,
+                        auto_renew=auto_renew
                     )
                 except Exception as sub_e:
                     return redirect(f"{settings.FRONTEND_PATH}/payment-failed/?data=Subscription-creation-failed")
 
+            # === Update TenantBillingPreferences with auto_renew status ===
+            from apps.billing.models import TenantBillingPreferences
+            prefs, created = TenantBillingPreferences.objects.update_or_create(
+                tenant_id=tenant_uuid,
+                defaults={
+                    'auto_renew_enabled': auto_renew,
+                    'renewal_status': 'active' if auto_renew else 'paused',
+                    'preferred_plan': plan,
+                    'subscription_expiry_date': subscription.end_date,
+                    'next_renewal_date': subscription.end_date if auto_renew else None,
+                }
+            )
+
             # === RecurringToken extraction logic - ONLY if auto_renew is enabled ===
             # Only save token if user has enabled auto-renewal BEFORE payment
-            if subscription.auto_renew:
+            if auto_renew:
                 if provider == "paystack":
                     data = response_data["data"]
                     auth = data.get('authorization') or data.get('customer', {}).get('authorization')
@@ -618,7 +637,7 @@ class PaymentWebhookViewSet(viewsets.ViewSet):
 
             # --- recurring token logic (for webhook delivery) - ONLY if auto_renew is enabled ---
             subscription = Subscription.objects.filter(tenant_id=tenant_id_param).first()
-            if subscription and subscription.auto_renew:
+            if subscription and subscription.tenant_billing_preferences and subscription.tenant_billing_preferences.auto_renew_enabled:
                 if provider == "paystack":
                     auth = data.get('authorization')
                     if auth:
