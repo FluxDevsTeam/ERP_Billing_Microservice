@@ -24,8 +24,6 @@ urlpatterns = [
     path('subscriptions/<uuid:pk>/toggle-auto-renew/', SubscriptionView.as_view({'post': 'toggle_auto_renew'}), name='subscription_toggle_auto_renew'),
     path('subscriptions/<uuid:pk>/audit-logs/', SubscriptionView.as_view({'get': 'get_audit_logs'}), name='subscription_audit_logs'),
     path('subscriptions/<uuid:pk>/change-card/', SubscriptionView.as_view({'post': 'change_subscription_card'}), name='subscription_change_card'),
-    path('subscriptions/<uuid:pk>/manual-payment/', SubscriptionView.as_view({'post': 'manual_payment_with_saved_card'}), name='subscription_manual_payment'),
-    path('subscriptions/<uuid:pk>/manual-payment-new-card/', SubscriptionView.as_view({'post': 'manual_payment_with_new_card'}), name='subscription_manual_payment_new_card'),
     path('subscriptions/<uuid:pk>/payment-info/', SubscriptionView.as_view({'get': 'get_payment_provider_info'}), name='subscription_payment_info'),
     path('subscriptions/<uuid:pk>/update-payment-method/', SubscriptionView.as_view({'post': 'update_payment_method'}), name='subscription_update_payment_method'),
     # path('subscriptions/check-expired/', SubscriptionView.as_view({'post': 'check_expired_subscriptions'}), name='subscription_check_expired'),
@@ -37,8 +35,6 @@ urlpatterns = [
     path('customer-portal/advance-renewal/', CustomerPortalViewSet.as_view({'post': 'advance_renewal'}), name='customer_portal_advance_renewal'),
     path('customer-portal/extend/', CustomerPortalViewSet.as_view({'post': 'extend_subscription'}), name='customer_portal_extend'),
     path('customer-portal/toggle-auto-renew/', CustomerPortalViewSet.as_view({'post': 'toggle_auto_renew'}), name='customer_portal_toggle_auto_renew'),
-    path('customer-portal/manual-payment/', CustomerPortalViewSet.as_view({'post': 'manual_payment_with_saved_card'}), name='customer_portal_manual_payment'),
-    path('customer-portal/manual-payment-new-card/', CustomerPortalViewSet.as_view({'post': 'manual_payment_with_new_card'}), name='customer_portal_manual_payment_new_card'),
 
     # AutoRenewalViewSet
     path('auto-renewals/', AutoRenewalViewSet.as_view({'get': 'list', 'post': 'create'}), name='auto_renewal_list_create'),

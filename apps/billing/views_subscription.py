@@ -181,16 +181,27 @@ class SubscriptionView(viewsets.ModelViewSet):
 
             machine_number = serializer.validated_data.get('machine_number')
             
+            # Trial doesn't need a plan_id - it gives access with limits (100 users, 10 branches)
             subscription, result = subscription_service.create_subscription(
                 tenant_id=str(tenant_id),
-                plan_id=str(plan_id),
+                plan_id=None,  # Trial is plan-agnostic - no plan required
                 user=str(request.user.email),
                 machine_number=machine_number,
                 is_trial=True
             )
 
+            # Send trial activation confirmation email
+            email_data = {
+                'user_email': request.user.email,
+                'email_type': 'confirmation',
+                'subject': 'Free Trial Activated',
+                'message': f'Your 7-day free trial has been activated successfully! You now have access to up to 100 users and 10 branches. Your trial ends on {subscription.trial_end_date.strftime("%Y-%m-%d") if subscription.trial_end_date else "N/A"}.',
+                'action': 'Trial Activated'
+            }
+            send_email_via_service(email_data)
+
             serializer = SubscriptionSerializer(subscription, context={'request': request})
-            print(f"SubscriptionView.activate_trial: Trial activated for tenant_id={tenant_id}, plan_id={plan_id}, machine_number={machine_number}")
+            print(f"SubscriptionView.activate_trial: Trial activated for tenant_id={tenant_id}, machine_number={machine_number}")
             return Response({
                 'data': 'Trial activated successfully',
                 'subscription': serializer.data,
@@ -338,26 +349,96 @@ class SubscriptionView(viewsets.ModelViewSet):
     @action(detail=True, methods=['post'], url_path='advance-renewal')
     @swagger_helper("Subscriptions", "advance_renewal")
     def advance_renewal(self, request, pk=None):
+        """
+        DEPRECATED: Use /extend/ endpoint instead (when < 30 days remaining) or manual-payment for multiple periods.
+        This endpoint triggers payment flow for advance renewal (multiple periods).
+        """
         try:
             serializer = self.get_serializer(data=request.data)
             serializer.is_valid(raise_exception=True)
-            subscription_service = SubscriptionService(request)
-            subscription, result = subscription_service.renew_in_advance(
-                subscription_id=pk,
-                periods=serializer.validated_data['periods'],
-                plan_id=serializer.validated_data.get('plan_id'),
-                user=str(request.user.id)
+            subscription = self.get_object()
+            
+            periods = serializer.validated_data['periods']
+            plan_id = serializer.validated_data.get('plan_id')
+            plan = subscription.plan
+            if plan_id:
+                plan = Plan.objects.get(id=plan_id)
+            
+            from decimal import Decimal
+            amount = Decimal(str(plan.price)) * periods
+            provider = request.data.get('provider', 'paystack')
+            
+            # Get tenant information
+            tenant_id = getattr(request.user, 'tenant', None)
+            if not tenant_id:
+                return Response({'error': 'No tenant associated with user'}, 
+                              status=status.HTTP_400_BAD_REQUEST)
+            
+            # Create payment record for tracking
+            payment = Payment.objects.create(
+                plan=plan,
+                subscription=subscription,
+                amount=amount,
+                transaction_id=str(uuid.uuid4()),
+                status='pending',
+                provider=provider,
+                payment_type='advance_renewal',
+                metadata={'periods': periods}
             )
-
-            serializer = SubscriptionSerializer(subscription)
-            print(
-                f"SubscriptionView.advance_renewal: Advance renewal for subscription_id={pk}, periods={serializer.validated_data['periods']}")
-            return Response({
-                'data': 'Subscription renewed in advance successfully.',
-                'subscription': serializer.data,
-                'periods': result['periods'],
-                'amount': result['amount']
-            })
+            
+            # Initialize payment flow (same as extend/manual-payment-new-card)
+            if provider == 'paystack':
+                from .payments import initiate_paystack_payment
+                from .utils import generate_confirm_token
+                confirm_token = generate_confirm_token(request.user, str(plan.id))
+                
+                response = initiate_paystack_payment(
+                    confirm_token=confirm_token,
+                    amount=float(amount),
+                    user=request.user,
+                    plan_id=str(plan.id),
+                    tenant_id=str(tenant_id),
+                    tenant_name=getattr(request.user, 'tenant_name', None),
+                    metadata={'action': 'advance_renewal', 'periods': periods, 'subscription_id': str(subscription.id)}
+                )
+                
+            elif provider == 'flutterwave':
+                from .payments import initiate_flutterwave_payment
+                from .utils import generate_confirm_token
+                confirm_token = generate_confirm_token(request.user, str(plan.id))
+                
+                response = initiate_flutterwave_payment(
+                    confirm_token=confirm_token,
+                    amount=float(amount),
+                    user=request.user,
+                    plan_id=str(plan.id),
+                    tenant_id=str(tenant_id),
+                    tenant_name=getattr(request.user, 'tenant_name', None),
+                    metadata={'action': 'advance_renewal', 'periods': periods, 'subscription_id': str(subscription.id)}
+                )
+            else:
+                payment.delete()
+                return Response({'error': f'Unsupported payment provider: {provider}'}, 
+                              status=status.HTTP_400_BAD_REQUEST)
+            
+            if response.status_code == 200:
+                response_data = response.data
+                return Response({
+                    'data': 'Advance renewal payment initiated. Complete payment to renew subscription.',
+                    'payment_id': str(payment.id),
+                    'subscription_id': str(subscription.id),
+                    'payment_url': response_data.get('payment_link'),
+                    'authorization_url': response_data.get('authorization_url'),
+                    'reference': response_data.get('tx_ref'),
+                    'amount': str(amount),
+                    'periods': periods,
+                    'provider': provider,
+                    'message': 'Please complete payment to renew subscription in advance'
+                })
+            else:
+                payment.delete()
+                error_data = response.data if hasattr(response, 'data') else {'error': 'Payment initialization failed'}
+                return Response(error_data, status=response.status_code)
 
         except ValidationError as e:
             print(f"SubscriptionView.advance_renewal: Validation error - {str(e)}")
@@ -370,24 +451,99 @@ class SubscriptionView(viewsets.ModelViewSet):
     @swagger_helper("Subscriptions", "extend_subscription")
     def extend_subscription(self, request, pk=None):
         """
-        Manually extend subscription when remaining days is below 30.
-        Adds one billing period to the existing subscription.
+        Extend subscription when remaining days is below 30.
+        This triggers a payment flow (redirects to payment page) - user must pay to extend.
+        After successful payment, subscription will be extended by one billing period.
         """
         try:
             subscription = self.get_object()
-            subscription_service = SubscriptionService(request)
-            subscription, result = subscription_service.extend_subscription(
-                subscription_id=pk,
-                user=str(request.user.id)
+            
+            # Validate subscription can be extended
+            if subscription.status not in ['active', 'expired']:
+                return Response({'error': 'Subscription must be active or expired to extend'}, 
+                              status=status.HTTP_400_BAD_REQUEST)
+            
+            remaining_days = subscription.get_remaining_days()
+            if remaining_days >= 30:
+                return Response({'error': 'Subscription can only be extended when remaining days is less than 30'}, 
+                              status=status.HTTP_400_BAD_REQUEST)
+            
+            # Calculate amount (one billing period)
+            from decimal import Decimal
+            amount = Decimal(str(subscription.plan.price))
+            provider = request.data.get('provider', 'paystack')
+            
+            # Get tenant information
+            tenant_id = getattr(request.user, 'tenant', None)
+            if not tenant_id:
+                return Response({'error': 'No tenant associated with user'}, 
+                              status=status.HTTP_400_BAD_REQUEST)
+            
+            # Create payment record for tracking
+            payment = Payment.objects.create(
+                plan=subscription.plan,
+                subscription=subscription,
+                amount=amount,
+                transaction_id=str(uuid.uuid4()),
+                status='pending',
+                provider=provider,
+                payment_type='extension'  # Mark as extension payment (will use 'advance' if 'extension' not available)
             )
-
-            serializer = SubscriptionSerializer(subscription)
-            return Response({
-                'data': 'Subscription extended successfully.',
-                'subscription': serializer.data,
-                'new_end_date': result['new_end_date'],
-                'remaining_days_before': result['remaining_days_before']
-            })
+            
+            # Initialize payment based on provider (same as manual-payment-new-card)
+            if provider == 'paystack':
+                from .payments import initiate_paystack_payment
+                from .utils import generate_confirm_token
+                confirm_token = generate_confirm_token(request.user, str(subscription.plan.id))
+                
+                response = initiate_paystack_payment(
+                    confirm_token=confirm_token,
+                    amount=float(amount),
+                    user=request.user,
+                    plan_id=str(subscription.plan.id),
+                    tenant_id=str(tenant_id),
+                    tenant_name=getattr(request.user, 'tenant_name', None),
+                    metadata={'action': 'extend_subscription', 'subscription_id': str(subscription.id)}
+                )
+                
+            elif provider == 'flutterwave':
+                from .payments import initiate_flutterwave_payment
+                from .utils import generate_confirm_token
+                confirm_token = generate_confirm_token(request.user, str(subscription.plan.id))
+                
+                response = initiate_flutterwave_payment(
+                    confirm_token=confirm_token,
+                    amount=float(amount),
+                    user=request.user,
+                    plan_id=str(subscription.plan.id),
+                    tenant_id=str(tenant_id),
+                    tenant_name=getattr(request.user, 'tenant_name', None),
+                    metadata={'action': 'extend_subscription', 'subscription_id': str(subscription.id)}
+                )
+            else:
+                payment.delete()
+                return Response({'error': f'Unsupported payment provider: {provider}'}, 
+                              status=status.HTTP_400_BAD_REQUEST)
+            
+            if response.status_code == 200:
+                response_data = response.data
+                return Response({
+                    'data': 'Payment initiated for subscription extension. Complete payment to extend your subscription.',
+                    'payment_id': str(payment.id),
+                    'subscription_id': str(subscription.id),
+                    'payment_url': response_data.get('payment_link'),
+                    'authorization_url': response_data.get('authorization_url'),
+                    'reference': response_data.get('tx_ref'),
+                    'amount': str(amount),
+                    'provider': provider,
+                    'periods': 1,
+                    'remaining_days_before': remaining_days,
+                    'message': 'Please complete payment to extend your subscription by one billing period'
+                })
+            else:
+                payment.delete()
+                error_data = response.data if hasattr(response, 'data') else {'error': 'Payment initialization failed'}
+                return Response(error_data, status=response.status_code)
 
         except ValidationError as e:
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
@@ -557,192 +713,6 @@ class SubscriptionView(viewsets.ModelViewSet):
         except Exception as e:
             print(f"SubscriptionView.change_subscription_card: Unexpected error - {str(e)}")
             return Response({'error': 'Card change failed'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-    @action(detail=True, methods=['post'], url_path='manual-payment')
-    @swagger_helper("Subscriptions", "manual_payment_with_saved_card")
-    def manual_payment_with_saved_card(self, request, pk=None):
-        """
-        Process a manual payment using saved card details for early renewal or top-up.
-        
-        Body params (JSON):
-        - amount: Amount to charge (optional, defaults to plan price)
-        - reason: Reason for manual payment (optional)
-        """
-        try:
-            subscription = self.get_object()
-            subscription_service = SubscriptionService(request)
-            
-            amount = request.data.get('amount')
-            reason = request.data.get('reason', 'manual_payment')
-            
-            if amount:
-                try:
-                    from decimal import Decimal
-                    amount = Decimal(str(amount))
-                    if amount <= 0:
-                        return Response(
-                            {'error': 'Amount must be greater than 0'}, 
-                            status=status.HTTP_400_BAD_REQUEST
-                        )
-                except (ValueError, TypeError):
-                    return Response(
-                        {'error': 'Invalid amount format'}, 
-                        status=status.HTTP_400_BAD_REQUEST
-                    )
-            
-            result = subscription_service.manual_payment_with_saved_card(
-                subscription_id=pk,
-                amount=amount,
-                user=str(request.user.id)
-            )
-            
-            if result['status'] == 'success':
-                return Response({
-                    'data': 'Manual payment initiated successfully',
-                    'subscription_id': str(subscription.id),
-                    'payment_url': result.get('payment_url'),
-                    'reference': result.get('reference'),
-                    'amount': str(amount) if amount else str(subscription.plan.price),
-                    'reason': reason,
-                    'message': result.get('message', 'Please complete payment using your saved card')
-                })
-            else:
-                error_msg = result.get('message', 'Manual payment failed')
-                if result.get('status') == 'skipped':
-                    return Response(
-                        {'error': error_msg, 'action_required': result.get('action_required')}, 
-                        status=status.HTTP_400_BAD_REQUEST
-                    )
-                else:
-                    return Response(
-                        {'error': error_msg}, 
-                        status=status.HTTP_400_BAD_REQUEST
-                    )
-                
-        except Exception as e:
-            print(f"SubscriptionView.manual_payment_with_saved_card: Unexpected error - {str(e)}")
-            return Response({'error': 'Manual payment failed'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-    @action(detail=True, methods=['post'], url_path='manual-payment-new-card')
-    @swagger_helper("Subscriptions", "manual_payment_with_new_card")
-    def manual_payment_with_new_card(self, request, pk=None):
-        """
-        Process a manual payment using new card details for early renewal or top-up.
-        This is different from saved card payments - user provides new payment details.
-        
-        Body params (JSON):
-        - amount: Amount to charge (optional, defaults to plan price)
-        - reason: Reason for manual payment (optional)
-        - provider: Payment provider ('paystack' or 'flutterwave')
-        """
-        try:
-            subscription = self.get_object()
-            
-            amount = request.data.get('amount')
-            reason = request.data.get('reason', 'manual_payment_new_card')
-            provider = request.data.get('provider', 'paystack')
-            
-            if amount:
-                try:
-                    from decimal import Decimal
-                    amount = Decimal(str(amount))
-                    if amount <= 0:
-                        return Response(
-                            {'error': 'Amount must be greater than 0'}, 
-                            status=status.HTTP_400_BAD_REQUEST
-                        )
-                except (ValueError, TypeError):
-                    return Response(
-                        {'error': 'Invalid amount format'}, 
-                        status=status.HTTP_400_BAD_REQUEST
-                    )
-            else:
-                from decimal import Decimal
-                amount = Decimal(str(subscription.plan.price))
-            
-            # Get tenant information
-            tenant_id = getattr(request.user, 'tenant', None)
-            if not tenant_id:
-                return Response(
-                    {'error': 'No tenant associated with user'}, 
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-            
-            # Create payment record for tracking
-            payment = Payment.objects.create(
-                plan=subscription.plan,
-                subscription=subscription,
-                amount=amount,
-                transaction_id=str(uuid.uuid4()),
-                status='pending',
-                provider=provider,
-                payment_type='manual'
-            )
-            
-            # Initialize payment based on provider
-            if provider == 'paystack':
-                from .payments import initiate_paystack_payment
-                
-                # Generate confirm token
-                from .utils import generate_confirm_token
-                confirm_token = generate_confirm_token(request.user, str(subscription.plan.id))
-                
-                # Initialize Paystack payment
-                response = initiate_paystack_payment(
-                    confirm_token=confirm_token,
-                    amount=float(amount),
-                    user=request.user,
-                    plan_id=str(subscription.plan.id),
-                    tenant_id=str(tenant_id),
-                    tenant_name=getattr(request.user, 'tenant_name', None)
-                )
-                
-            elif provider == 'flutterwave':
-                from .payments import initiate_flutterwave_payment
-                
-                # Generate confirm token
-                from .utils import generate_confirm_token
-                confirm_token = generate_confirm_token(request.user, str(subscription.plan.id))
-                
-                # Initialize Flutterwave payment
-                response = initiate_flutterwave_payment(
-                    confirm_token=confirm_token,
-                    amount=float(amount),
-                    user=request.user,
-                    plan_id=str(subscription.plan.id),
-                    tenant_id=str(tenant_id),
-                    tenant_name=getattr(request.user, 'tenant_name', None)
-                )
-            else:
-                payment.delete()  # Clean up payment record
-                return Response(
-                    {'error': f'Unsupported payment provider: {provider}'}, 
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-            
-            if response.status_code == 200:
-                response_data = response.data
-                return Response({
-                    'data': 'Manual payment initiated successfully with new card',
-                    'payment_id': str(payment.id),
-                    'subscription_id': str(subscription.id),
-                    'payment_url': response_data.get('payment_link'),
-                    'authorization_url': response_data.get('authorization_url'),
-                    'reference': response_data.get('tx_ref'),
-                    'amount': str(amount),
-                    'provider': provider,
-                    'reason': reason,
-                    'message': 'Please complete payment with your new card details'
-                })
-            else:
-                # Clean up failed payment record
-                payment.delete()
-                error_data = response.data if hasattr(response, 'data') else {'error': 'Payment initialization failed'}
-                return Response(error_data, status=response.status_code)
-                
-        except Exception as e:
-            print(f"SubscriptionView.manual_payment_with_new_card: Unexpected error - {str(e)}")
-            return Response({'error': 'Manual payment with new card failed'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=True, methods=['get'], url_path='payment-info')
     @swagger_helper("Subscriptions", "get_payment_provider_info")

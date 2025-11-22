@@ -10,6 +10,9 @@ class Payment(models.Model):
         ('renewal', 'Renewal'),
         ('upgrade', 'Upgrade'),
         ('advance', 'Advance'),
+        ('advance_renewal', 'Advance Renewal'),
+        ('extension', 'Extension'),
+        ('manual', 'Manual'),
     )
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     STATUS_CHOICES = (

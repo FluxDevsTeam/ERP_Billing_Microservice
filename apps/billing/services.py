@@ -28,22 +28,55 @@ class SubscriptionService:
         self.circuit_breaker = IdentityServiceCircuitBreaker()
 
     @transaction.atomic
-    def create_subscription(self, tenant_id: str, plan_id: str, user: str = None, machine_number: str = None, is_trial: bool = False) -> Tuple[Subscription, Dict[str, Any]]:
+    def create_subscription(self, tenant_id: str, plan_id: str = None, user: str = None, machine_number: str = None, is_trial: bool = False) -> Tuple[Subscription, Dict[str, Any]]:
         """
         Create a new subscription. If there's a previous subscription (trial or expired),
         carry over remaining days to the new subscription.
+        
+        For trials: plan_id can be None - trial gives access with limits (100 users, 10 branches) without plan restrictions.
+        For paid subscriptions: plan_id is required.
         """
         try:
             tenant_uuid = uuid.UUID(tenant_id)
-            plan_uuid = uuid.UUID(plan_id)
         except ValueError:
-            logger.error(f"Subscription creation failed: Invalid tenant_id {tenant_id} or plan_id {plan_id}")
-            raise ValidationError("Invalid tenant_id or plan_id format")
+            logger.error(f"Subscription creation failed: Invalid tenant_id {tenant_id}")
+            raise ValidationError("Invalid tenant_id format")
 
-        plan = Plan.objects.get(id=plan_uuid)
-        if not plan.is_active or plan.discontinued:
-            logger.warning(f"Subscription creation failed: Plan {plan_id} is not available")
-            raise ValidationError("Plan is not available")
+        # For trials, plan is optional (trial gives access with limits: 100 users, 10 branches)
+        # For paid subscriptions, plan is required
+        plan = None
+        if is_trial:
+            # Trial doesn't require a plan - it gives access with trial limits
+            # But we still need a plan object for the subscription model
+            # Use a default "Free Trial" plan or create a placeholder
+            plan = Plan.objects.filter(name__icontains='trial').first()
+            if not plan:
+                # Create a default trial plan if it doesn't exist
+                plan = Plan.objects.create(
+                    name='Free Trial',
+                    description='7-day free trial with 100 users and 10 branches',
+                    industry='Other',
+                    max_users=100,  # Trial limit: 100 users
+                    max_branches=10,  # Trial limit: 10 branches
+                    price=0,
+                    billing_period='monthly',
+                    is_active=True,
+                    discontinued=False,
+                    tier_level='tier4'
+                )
+        else:
+            # Paid subscription requires a plan
+            if not plan_id:
+                raise ValidationError("plan_id is required for paid subscriptions")
+            try:
+                plan_uuid = uuid.UUID(plan_id)
+                plan = Plan.objects.get(id=plan_uuid)
+                if not plan.is_active or plan.discontinued:
+                    logger.warning(f"Subscription creation failed: Plan {plan_id} is not available")
+                    raise ValidationError("Plan is not available")
+            except ValueError:
+                logger.error(f"Subscription creation failed: Invalid plan_id {plan_id}")
+                raise ValidationError("Invalid plan_id format")
 
         # Check for active subscriptions
         existing_active_sub = Subscription.objects.filter(
@@ -114,16 +147,18 @@ class SubscriptionService:
             
             trial_end_date = timezone.now() + timezone.timedelta(days=TRIAL_DURATION_DAYS)
 
-        tenant_info = self._get_tenant_with_fallback(tenant_id)
-        errors = self._validate_business_rules(tenant_info or {}, plan)
-        if errors:
-            logger.warning(f"Subscription creation failed for tenant {tenant_id}: {', '.join(errors)}")
-            raise ValidationError(f"Cannot create subscription: {', '.join(errors)}")
+        # For trials, skip business rules and usage limit checks (trial has its own limits: 100 users, 10 branches)
+        if not is_trial:
+            tenant_info = self._get_tenant_with_fallback(tenant_id)
+            errors = self._validate_business_rules(tenant_info or {}, plan)
+            if errors:
+                logger.warning(f"Subscription creation failed for tenant {tenant_id}: {', '.join(errors)}")
+                raise ValidationError(f"Cannot create subscription: {', '.join(errors)}")
 
-        can_switch, switch_errors = self._check_usage_limits(tenant_id, plan)
-        if not can_switch:
-            logger.warning(f"Subscription creation failed for tenant {tenant_id}: {', '.join(switch_errors)}")
-            raise ValidationError(f"Cannot create subscription: {', '.join(switch_errors)}")
+            can_switch, switch_errors = self._check_usage_limits(tenant_id, plan)
+            if not can_switch:
+                logger.warning(f"Subscription creation failed for tenant {tenant_id}: {', '.join(switch_errors)}")
+                raise ValidationError(f"Cannot create subscription: {', '.join(switch_errors)}")
 
         # Calculate start date
         now = timezone.now()

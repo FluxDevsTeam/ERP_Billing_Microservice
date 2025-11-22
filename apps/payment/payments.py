@@ -5,7 +5,7 @@ from rest_framework.response import Response
 from django.conf import settings
 
 
-def initiate_flutterwave_payment(confirm_token, amount, user, plan_id, tenant_id, tenant_name=None):
+def initiate_flutterwave_payment(confirm_token, amount, user, plan_id, tenant_id, tenant_name=None, metadata=None):
     try:
         flutterwave_key = settings.PAYMENT_PROVIDERS["flutterwave"]["secret_key"]
         url = "https://api.flutterwave.com/v3/payments"
@@ -21,7 +21,7 @@ def initiate_flutterwave_payment(confirm_token, amount, user, plan_id, tenant_id
             "amount": str(amount),
             "currency": settings.PAYMENT_CURRENCY,
             "redirect_url": redirect_url,
-            "meta": {"consumer_id": user.id, "plan_id": plan_id, "tenant_id": tenant_id},
+            "meta": {**{"consumer_id": user.id, "plan_id": plan_id, "tenant_id": tenant_id}, **(metadata or {})},
             "customer": {
                 "email": user.email,
                 "phonenumber": phone_no,
@@ -57,7 +57,7 @@ def initiate_flutterwave_payment(confirm_token, amount, user, plan_id, tenant_id
         return Response({"error": "Payment processing failed. Please try again."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
-def initiate_paystack_payment(confirm_token, amount, user, plan_id, tenant_id, tenant_name=None):
+def initiate_paystack_payment(confirm_token, amount, user, plan_id, tenant_id, tenant_name=None, metadata=None):
     try:
         paystack_key = settings.PAYMENT_PROVIDERS['paystack']['secret_key']
         headers = {"Authorization": f"Bearer {paystack_key}", "Content-Type": "application/json"}
@@ -74,11 +74,7 @@ def initiate_paystack_payment(confirm_token, amount, user, plan_id, tenant_id, t
             "currency": settings.PAYMENT_CURRENCY,
             "reference": reference,
             "callback_url": callback_url,
-            "metadata": {
-                "consumer_id": user.id,
-                "plan_id": plan_id,
-                "tenant_id": tenant_id
-            }
+            "metadata": {**{"consumer_id": user.id, "plan_id": plan_id, "tenant_id": tenant_id}, **(metadata or {})}
         }
         response = requests.post(url, headers=headers, json=data)
         response.raise_for_status()

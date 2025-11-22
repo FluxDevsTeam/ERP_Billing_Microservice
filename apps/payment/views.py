@@ -293,7 +293,10 @@ class PaymentVerifyViewSet(viewsets.ViewSet):
 
             existing_payment = Payment.objects.filter(transaction_id=tx_ref).first()
             if existing_payment and existing_payment.status == 'completed':
-                return redirect(f"https://example.com/plan/{plan.id}")
+                # If extension payment, redirect to subscription
+                if existing_payment.payment_type == 'extension' and existing_payment.subscription:
+                    return redirect(f"{settings.FRONTEND_PATH}/subscription/{existing_payment.subscription.id}/?status=extended")
+                return redirect(f"{settings.FRONTEND_PATH}/plan/{plan.id}")
 
             provider_config = settings.PAYMENT_PROVIDERS[provider]
             url = provider_config["verify_url"].format(transaction_id)
@@ -351,52 +354,102 @@ class PaymentVerifyViewSet(viewsets.ViewSet):
             payment.transaction_id = flutterwave_transaction_id if provider == "flutterwave" else transaction_id
             payment.save()
 
-            # Create or update subscription using SubscriptionService for consistency
             subscription_service = SubscriptionService(request)
-            try:
-                tenant_uuid = uuid.UUID(tenant_id_param)
-                subscription, result = subscription_service.create_subscription(
-                    tenant_id=str(tenant_uuid),
-                    plan_id=str(plan.id),
-                    user=str(user.id) if user else 'system',
-                    is_trial=False
-                )
-            except Exception as sub_e:
-                return redirect(f"{settings.FRONTEND_PATH}/payment-failed/?data=Subscription-creation-failed")
+            tenant_uuid = uuid.UUID(tenant_id_param)
+            
+            # Check if this is an extension or advance_renewal payment (uses existing subscription)
+            if payment.subscription and payment.payment_type in ['extension', 'advance_renewal', 'advance']:
+                # This is an extension/advance renewal payment - extend the existing subscription
+                try:
+                    subscription = payment.subscription
+                    # Calculate periods from amount and plan price (for advance_renewal, periods = amount / plan.price)
+                    # For extension, always 1 period
+                    if payment.payment_type == 'extension':
+                        periods = 1
+                    else:
+                        # Calculate periods from amount (round to nearest integer)
+                        from decimal import Decimal
+                        periods = int(round(payment.amount / subscription.plan.price))
+                        periods = max(1, periods)  # At least 1 period
+                    
+                    subscription, extend_result = subscription_service.renew_in_advance(
+                        subscription_id=str(subscription.id),
+                        periods=periods,
+                        plan_id=None,  # Use current plan
+                        user=str(user.id) if user else 'system'
+                    )
+                    
+                    # Send confirmation email
+                    if user and user.email:
+                        if payment.payment_type == 'extension':
+                            subject = 'Subscription Extended'
+                            message = f'Your subscription has been extended successfully after payment. New end date: {subscription.end_date.strftime("%Y-%m-%d") if subscription.end_date else "N/A"}.'
+                            action = 'Subscription Extended'
+                        else:
+                            subject = 'Subscription Renewed in Advance'
+                            message = f'Your subscription has been renewed in advance for {periods} period(s). New end date: {subscription.end_date.strftime("%Y-%m-%d") if subscription.end_date else "N/A"}.'
+                            action = 'Subscription Renewed'
+                        
+                        email_data = {
+                            'user_email': user.email,
+                            'email_type': 'confirmation',
+                            'subject': subject,
+                            'message': message,
+                            'action': action
+                        }
+                        send_email_via_service(email_data)
+                    
+                    return redirect(f"{settings.FRONTEND_PATH}/subscription/{subscription.id}/?status={'extended' if payment.payment_type == 'extension' else 'renewed'}")
+                except Exception as ext_e:
+                    logger.error(f"Extension/Advance renewal payment processing failed: {str(ext_e)}")
+                    return redirect(f"{settings.FRONTEND_PATH}/payment-failed/?data=Extension-failed")
+            else:
+                # Create or update subscription using SubscriptionService for consistency
+                try:
+                    subscription, result = subscription_service.create_subscription(
+                        tenant_id=str(tenant_uuid),
+                        plan_id=str(plan.id),
+                        user=str(user.id) if user else 'system',
+                        is_trial=False
+                    )
+                except Exception as sub_e:
+                    return redirect(f"{settings.FRONTEND_PATH}/payment-failed/?data=Subscription-creation-failed")
 
-            # === RecurringToken extraction logic (Paystack) ===
-            if provider == "paystack":
-                data = response_data["data"]
-                auth = data.get('authorization') or data.get('customer', {}).get('authorization')
-                if auth:
+            # === RecurringToken extraction logic - ONLY if auto_renew is enabled ===
+            # Only save token if user has enabled auto-renewal BEFORE payment
+            if subscription.auto_renew:
+                if provider == "paystack":
+                    data = response_data["data"]
+                    auth = data.get('authorization') or data.get('customer', {}).get('authorization')
+                    if auth:
+                        RecurringToken.objects.update_or_create(
+                            subscription=subscription,
+                            defaults={
+                                'provider': 'paystack',
+                                'paystack_authorization_code': auth.get('authorization_code'),
+                                'paystack_subscription_code': data.get('subscription_code'),
+                                'last4': auth.get('last4'),
+                                'card_brand': auth.get('brand'),
+                                'email': data.get('customer', {}).get('email'),
+                                'is_active': True
+                            }
+                        )
+
+                # === RecurringToken extraction logic (Flutterwave) ===
+                elif provider == "flutterwave":
+                    data = response_data["data"]
                     RecurringToken.objects.update_or_create(
                         subscription=subscription,
                         defaults={
-                            'provider': 'paystack',
-                            'paystack_authorization_code': auth.get('authorization_code'),
-                            'paystack_subscription_code': data.get('subscription_code'),
-                            'last4': auth.get('last4'),
-                            'card_brand': auth.get('brand'),
+                            'provider': 'flutterwave',
+                            'flutterwave_payment_method_id': data.get('payment_source', {}).get('id'),
+                            'flutterwave_customer_id': data.get('customer', {}).get('id'),
+                            'last4': data.get('card', {}).get('last4'),
+                            'card_brand': data.get('card', {}).get('type'),
                             'email': data.get('customer', {}).get('email'),
                             'is_active': True
                         }
                     )
-
-            # === RecurringToken extraction logic (Flutterwave) ===
-            elif provider == "flutterwave":
-                data = response_data["data"]
-                RecurringToken.objects.update_or_create(
-                    subscription=subscription,
-                    defaults={
-                        'provider': 'flutterwave',
-                        'flutterwave_payment_method_id': data.get('payment_source', {}).get('id'),
-                        'flutterwave_customer_id': data.get('customer', {}).get('id'),
-                        'last4': data.get('card', {}).get('last4'),
-                        'card_brand': data.get('card', {}).get('type'),
-                        'email': data.get('customer', {}).get('email'),
-                        'is_active': True
-                    }
-                )
 
             # Send payment success email
             if user and user.email:
@@ -563,34 +616,37 @@ class PaymentWebhookViewSet(viewsets.ViewSet):
             except Exception as sub_e:
                 return Response({"error": "Subscription creation failed"}, status=500)
 
-            # --- recurring token logic (for webhook delivery) ---
-            if provider == "paystack":
-                auth = data.get('authorization')
-                RecurringToken.objects.update_or_create(
-                    subscription=Subscription.objects.filter(tenant_id=tenant_id_param).first(),
-                    defaults={
-                        'provider': 'paystack',
-                        'paystack_authorization_code': auth.get('authorization_code') if auth else None,
-                        'paystack_subscription_code': data.get('subscription_code'),
-                        'last4': auth.get('last4') if auth else '',
-                        'card_brand': auth.get('brand') if auth else '',
-                        'email': data.get('customer', {}).get('email'),
-                        'is_active': True
-                    }
-                )
-            elif provider == "flutterwave":
-                RecurringToken.objects.update_or_create(
-                    subscription=Subscription.objects.filter(tenant_id=tenant_id_param).first(),
-                    defaults={
-                        'provider': 'flutterwave',
-                        'flutterwave_payment_method_id': data.get('payment_source', {}).get('id'),
-                        'flutterwave_customer_id': data.get('customer', {}).get('id'),
-                        'last4': data.get('card', {}).get('last4'),
-                        'card_brand': data.get('card', {}).get('type'),
-                        'email': data.get('customer', {}).get('email'),
-                        'is_active': True
-                    }
-                )
+            # --- recurring token logic (for webhook delivery) - ONLY if auto_renew is enabled ---
+            subscription = Subscription.objects.filter(tenant_id=tenant_id_param).first()
+            if subscription and subscription.auto_renew:
+                if provider == "paystack":
+                    auth = data.get('authorization')
+                    if auth:
+                        RecurringToken.objects.update_or_create(
+                            subscription=subscription,
+                            defaults={
+                                'provider': 'paystack',
+                                'paystack_authorization_code': auth.get('authorization_code') if auth else None,
+                                'paystack_subscription_code': data.get('subscription_code'),
+                                'last4': auth.get('last4') if auth else '',
+                                'card_brand': auth.get('brand') if auth else '',
+                                'email': data.get('customer', {}).get('email'),
+                                'is_active': True
+                            }
+                        )
+                elif provider == "flutterwave":
+                    RecurringToken.objects.update_or_create(
+                        subscription=subscription,
+                        defaults={
+                            'provider': 'flutterwave',
+                            'flutterwave_payment_method_id': data.get('payment_source', {}).get('id'),
+                            'flutterwave_customer_id': data.get('customer', {}).get('id'),
+                            'last4': data.get('card', {}).get('last4'),
+                            'card_brand': data.get('card', {}).get('type'),
+                            'email': data.get('customer', {}).get('email'),
+                            'is_active': True
+                        }
+                    )
 
             # Send payment success email
             email_data = {
