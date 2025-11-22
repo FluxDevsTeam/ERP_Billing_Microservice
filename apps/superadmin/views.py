@@ -118,8 +118,10 @@ class SuperadminPortalViewSet(viewsets.ViewSet):
             ).order_by('-customer_count')
 
             # Renewal Success Rate (auto-renewal success / total due)
-            due_auto_renewals = AutoRenewal.objects.filter(
-                status__in=['active', 'paused']
+            from apps.billing.models import TenantBillingPreferences
+            due_auto_renewals = TenantBillingPreferences.objects.filter(
+                auto_renew_enabled=True,
+                renewal_status__in=['active', 'paused']
             ).count()
             # This is a simplified calculation; a more accurate one would track historical renewals
             renewal_success_rate = 95.0  # Placeholder, would need to be calculated from actual data
@@ -197,8 +199,9 @@ class SuperadminPortalViewSet(viewsets.ViewSet):
 
             now = timezone.now()
             currently_active_free_trials = Subscription.objects.filter(status='trial', trial_end_date__gte=now).count()
-            total_auto_renew_on = AutoRenewal.objects.filter(status='active').count()
-            total_auto_renew_off = AutoRenewal.objects.filter(status='paused').count()
+            from apps.billing.models import TenantBillingPreferences
+            total_auto_renew_on = TenantBillingPreferences.objects.filter(auto_renew_enabled=True, renewal_status='active').count()
+            total_auto_renew_off = TenantBillingPreferences.objects.filter(auto_renew_enabled=False).count()
             # Placeholder for branches: optional, needs model or per-tenant sum
             total_business_branches = 0
             analytics_data['currently_active_free_trials'] = currently_active_free_trials
@@ -354,26 +357,40 @@ class SuperadminPortalViewSet(viewsets.ViewSet):
         results = PaymentSerializer(qs.order_by('-payment_date')[:100], many=True).data
         return Response({'results': results, 'summary': summary})
 
-    @swagger_helper(tags=['Superadmin Portal'], model='RecurringToken')
-    @action(detail=False, methods=['get'], url_path='recurring-tokens')
-    def list_recurring_tokens(self, request):
+    @swagger_helper(tags=['Superadmin Portal'], model='TenantBillingPreferences')
+    @action(detail=False, methods=['get'], url_path='billing-preferences')
+    def list_billing_preferences(self, request):
         """
-        List all RecurringTokens (active/inactive).
-        Filtering: status, provider, tenant, subscription. Returns token summary info for dashboard.
+        List all TenantBillingPreferences (active/inactive auto-renewal).
+        Filtering: auto_renew_enabled, renewal_status, tenant_id. Returns billing preferences for dashboard.
         """
-        from apps.billing.models import RecurringToken
+        from apps.billing.models import TenantBillingPreferences
         filters = {}
-        for f in ['provider','is_active','subscription_id']:
-            v = request.query_params.get(f)
-            if v: filters[f] = v
+        if request.query_params.get('auto_renew_enabled'):
+            filters['auto_renew_enabled'] = request.query_params.get('auto_renew_enabled').lower() == 'true'
+        if request.query_params.get('renewal_status'):
+            filters['renewal_status'] = request.query_params.get('renewal_status')
         if request.query_params.get('tenant_id'):
-            filters['subscription__tenant_id'] = request.query_params['tenant_id']
-        qs = RecurringToken.objects.select_related('subscription').filter(**filters)
-        from apps.billing.serializers import RecurringTokenSerializer
+            filters['tenant_id'] = request.query_params.get('tenant_id')
+
+        qs = TenantBillingPreferences.objects.filter(**filters)
         total = qs.count()
-        actives = qs.filter(is_active=True).count()
-        results = RecurringTokenSerializer(qs.order_by('-created_at')[:100], many=True).data
-        return Response({'total': total, 'active': actives, 'results': results})
+        active_auto_renew = qs.filter(auto_renew_enabled=True, renewal_status='active').count()
+        results = []
+        for pref in qs.order_by('-updated_at')[:100]:
+            results.append({
+                'tenant_id': str(pref.tenant_id),
+                'auto_renew_enabled': pref.auto_renew_enabled,
+                'renewal_status': pref.renewal_status,
+                'payment_provider': pref.payment_provider,
+                'card_last4': pref.card_last4,
+                'card_brand': pref.card_brand,
+                'subscription_expiry_date': pref.subscription_expiry_date,
+                'next_renewal_date': pref.next_renewal_date,
+                'last_payment_at': pref.last_payment_at,
+                'updated_at': pref.updated_at,
+            })
+        return Response({'total': total, 'active_auto_renew': active_auto_renew, 'results': results})
 
     @swagger_helper(tags=['Superadmin Portal'], model='TrialUsage')
     @action(detail=False, methods=['get'], url_path='trials')
