@@ -9,7 +9,7 @@ import requests
 from typing import Optional, Dict, Any, Tuple
 from decimal import Decimal
 
-from .models import Plan, Subscription, AuditLog, SubscriptionCredit, AutoRenewal, TrialUsage
+from .models import Plan, Subscription, AuditLog, SubscriptionCredit, AutoRenewal, TrialUsage, RecurringToken
 from .utils import IdentityServiceClient
 from .circuit_breaker import IdentityServiceCircuitBreaker
 from .period_calculator import PeriodCalculator
@@ -1495,43 +1495,74 @@ class SubscriptionService:
 
     def manual_payment_with_saved_card(self, subscription_id: str, amount: Decimal = None, user: str = None) -> Dict[str, Any]:
         """
-        Process a manual payment using saved card details (for early renewal or top-up).
-        
-        Args:
-            subscription_id: The subscription ID
-            amount: Amount to charge (defaults to plan price)
-            user: User making the payment
-        
-        Returns:
-            Dict with payment URL and details
+        Process a manual payment using saved recurring card/token details (for early renewal or top-up).
+        Amount defaults to plan price.
         """
         try:
             subscription = Subscription.objects.get(id=subscription_id)
             charge_amount = amount or subscription.plan.price
-            
-            # Get the active auto-renewal and stored payment provider info
-            auto_renewal = AutoRenewal.objects.filter(
-                subscription=subscription,
-                status='active'
-            ).first()
-            
-            if not auto_renewal:
-                return {'status': 'error', 'message': 'No active auto-renewal found'}
-            
-            provider_info = self._extract_payment_provider_info(auto_renewal)
-            
-            if provider_info.get('provider') == 'paystack':
-                return self._paystack_manual_charge(subscription, charge_amount, provider_info, user)
-            elif provider_info.get('provider') == 'flutterwave':
-                return self._flutterwave_manual_charge(subscription, charge_amount, provider_info, user)
+            token = getattr(subscription, 'recurring_token', None)
+            if not token or not token.is_active:
+                return {'status': 'error', 'message': 'No active recurring payment method found'}
+            if token.provider == 'paystack':
+                return self._paystack_server_charge(subscription, charge_amount, token, user)
+            elif token.provider == 'flutterwave':
+                return self._flutterwave_server_charge(subscription, charge_amount, token, user)
             else:
                 return {'status': 'error', 'message': 'No saved payment method found'}
-                
         except Subscription.DoesNotExist:
             return {'status': 'error', 'message': 'Subscription not found'}
         except Exception as e:
             logger.error(f"Manual payment failed: {str(e)}")
             return {'status': 'error', 'message': str(e)}
+
+    def _paystack_server_charge(self, subscription, amount, token, user):
+        # Server-side call to Paystack /transaction/charge_authorization endpoint using stored authorization_code
+        import requests
+        paystack_secret = settings.PAYMENT_PROVIDERS['paystack']['secret_key']
+        data = {
+            "amount": int(float(amount) * 100),
+            "email": token.email,
+            "authorization_code": token.paystack_authorization_code
+        }
+        headers = {
+            "Authorization": f"Bearer {paystack_secret}",
+            "Content-Type": "application/json"
+        }
+        resp = requests.post("https://api.paystack.co/transaction/charge_authorization", json=data, headers=headers, timeout=15)
+        resp_json = resp.json()
+        if resp.status_code == 200 and resp_json.get("status"):
+            self._audit_log(subscription, "recurring_charge_success", user, details={"provider": "paystack", "amount": str(amount)})
+            return {"status": "success", "message": "Payment charged via Paystack recurring token", "response": resp_json}
+        else:
+            self._audit_log(subscription, "recurring_charge_failed", user, details={"provider": "paystack", "error": resp_json})
+            return {"status": "error", "message": resp_json.get('message', 'Charge failed'), "response": resp_json}
+
+    def _flutterwave_server_charge(self, subscription, amount, token, user):
+        # Server-side call to Flutterwave /charges endpoint with recurring: true and payment_method_id
+        import requests
+        flutter_secret = settings.PAYMENT_PROVIDERS['flutterwave']['secret_key']
+        data = {
+            "amount": str(amount),
+            "currency": settings.PAYMENT_CURRENCY,
+            "customer": token.flutterwave_customer_id,
+            "payment_type": "card",
+            "payment_method": token.flutterwave_payment_method_id,
+            "tx_ref": str(uuid.uuid4()),
+            "recurring": True
+        }
+        headers = {
+            "Authorization": f"Bearer {flutter_secret}",
+            "Content-Type": "application/json"
+        }
+        resp = requests.post("https://api.flutterwave.com/v3/charges", json=data, headers=headers, timeout=15)
+        resp_json = resp.json()
+        if resp.status_code == 200 and resp_json.get("status") == 'success':
+            self._audit_log(subscription, "recurring_charge_success", user, details={"provider": "flutterwave", "amount": str(amount)})
+            return {"status": "success", "message": "Payment charged via Flutterwave recurring token", "response": resp_json}
+        else:
+            self._audit_log(subscription, "recurring_charge_failed", user, details={"provider": "flutterwave", "error": resp_json})
+            return {"status": "error", "message": resp_json.get('message', 'Charge failed'), "response": resp_json}
 
     def manual_payment_with_new_card(self, subscription_id: str, amount: Decimal = None, provider: str = 'paystack', user: str = None) -> Dict[str, Any]:
         """
@@ -1732,143 +1763,6 @@ class SubscriptionService:
             payment.delete()
             return {'status': 'error', 'message': str(e)}
 
-    def _paystack_manual_charge(self, subscription: Subscription, amount: Decimal, provider_info: Dict, user: str = None) -> Dict[str, Any]:
-        """Process manual charge using Paystack saved authorization - Using direct charge method like Node.js example"""
-        try:
-            # Get stored authorization code
-            authorization_code = provider_info.get('authorization_code')
-            customer_email = provider_info.get('customer_email', '')
-            
-            if not authorization_code:
-                return {
-                    'status': 'skipped', 
-                    'reason': 'No authorization code found - user must make new payment',
-                    'action_required': 'new_payment'
-                }
-            
-            # Use direct charge endpoint like in the Node.js example
-            paystack_key = settings.PAYMENT_PROVIDERS['paystack']['secret_key']
-            url = "https://api.paystack.co/transaction/charge_authorization"
-            headers = {
-                "Authorization": f"Bearer {paystack_key}", 
-                "Content-Type": "application/json"
-            }
-            
-            data = {
-                "email": customer_email,
-                "amount": int(float(amount) * 100),  # Convert to kobo
-                "authorization_code": authorization_code
-            }
-            
-            response = requests.post(url, headers=headers, json=data, timeout=10)
-            response.raise_for_status()
-            response_data = response.json()
-            
-            if response_data.get('status') and response_data.get('data'):
-                transaction_data = response_data['data']
-                
-                # Create Payment record for tracking
-                from apps.payment.models import Payment
-                payment = Payment.objects.create(
-                    plan=subscription.plan,
-                    subscription=subscription,
-                    amount=amount,
-                    transaction_id=transaction_data.get('reference', str(uuid.uuid4())),
-                    status='completed' if transaction_data.get('status') == 'success' else 'failed',
-                    provider='paystack',
-                    payment_type='manual'
-                )
-                
-                # If successful, extend subscription
-                if transaction_data.get('status') == 'success':
-                    # Extend subscription by one billing period
-                    new_end_date = subscription.end_date
-                    if subscription.plan.billing_period == 'monthly':
-                        from dateutil.relativedelta import relativedelta
-                        new_end_date = subscription.end_date + relativedelta(months=1)
-                    elif subscription.plan.billing_period == 'quarterly':
-                        new_end_date = subscription.end_date + relativedelta(months=3)
-                    elif subscription.plan.billing_period == 'biannual':
-                        new_end_date = subscription.end_date + relativedelta(months=6)
-                    elif subscription.plan.billing_period == 'annual':
-                        new_end_date = subscription.end_date + relativedelta(years=1)
-                    
-                    subscription.end_date = new_end_date
-                    subscription.status = 'active'
-                    subscription.save()
-                    
-                    logger.info(f"Paystack direct charge successful for subscription {subscription.id}")
-                    return {
-                        'status': 'success',
-                        'message': 'Payment successful and subscription extended',
-                        'payment_id': str(payment.id),
-                        'transaction_id': transaction_data.get('reference'),
-                        'amount': str(amount),
-                        'new_end_date': new_end_date.isoformat()
-                    }
-                else:
-                    return {
-                        'status': 'failed',
-                        'message': f"Payment failed: {transaction_data.get('gateway_response', 'Unknown error')}",
-                        'payment_id': str(payment.id)
-                    }
-            else:
-                error_msg = response_data.get('message', 'Payment initialization failed')
-                return {'status': 'error', 'message': error_msg}
-                
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Paystack API error: {str(e)}")
-            return {'status': 'error', 'message': 'Paystack service unavailable'}
-        except Exception as e:
-            logger.error(f"Paystack direct charge failed: {str(e)}")
-            return {'status': 'error', 'message': str(e)}
-
-    def _flutterwave_manual_charge(self, subscription: Subscription, amount: Decimal, provider_info: Dict, user: str = None) -> Dict[str, Any]:
-        """Process manual charge using Flutterwave saved payment plan"""
-        try:
-            # Flutterwave also requires the customer to complete payment flow
-            # We can initialize a transaction with the payment plan
-            
-            flutterwave_key = settings.PAYMENT_PROVIDERS["flutterwave"]["secret_key"]
-            url = "https://api.flutterwave.com/v3/payments"
-            headers = {"Authorization": f"Bearer {flutterwave_key}"}
-            
-            # Get customer email from subscription or request
-            customer_email = getattr(self.request.user, 'email', '') if self.request else ''
-            
-            data = {
-                "tx_ref": f"MANUAL_{subscription.id}_{int(timezone.now().timestamp())}",
-                "amount": str(amount),
-                "currency": settings.PAYMENT_CURRENCY,
-                "customer": {
-                    "email": customer_email
-                },
-                "customizations": {
-                    "title": "ERP Manual Payment"
-                }
-                # Note: Flutterwave doesn't support direct plan charging in initialize API
-                # Customer would need to select saved card in the payment modal
-            }
-            
-            response = requests.post(url, headers=headers, json=data, timeout=10)
-            response.raise_for_status()
-            response_data = response.json()
-            
-            if response_data.get('status') == 'success':
-                return {
-                    'status': 'success',
-                    'payment_url': response_data['data']['link'],
-                    'flw_ref': response_data['data']['flw_ref'],
-                    'message': 'Please complete payment using saved card'
-                }
-            else:
-                error_msg = response_data.get('message', 'Unknown error')
-                return {'status': 'error', 'message': error_msg}
-                
-        except Exception as e:
-            logger.error(f"Flutterwave manual charge failed: {str(e)}")
-            return {'status': 'error', 'message': str(e)}
-
     def process_auto_renewal_payment(self, subscription: Subscription, auto_renewal: AutoRenewal) -> Dict[str, Any]:
         """
         Process auto-renewal payment using direct charge method (like Node.js example).
@@ -1908,7 +1802,7 @@ class SubscriptionService:
             url = "https://api.paystack.co/transaction/charge_authorization"
             headers = {
                 "Authorization": f"Bearer {paystack_key}", 
-                "Content-Type": 'application/json'
+                "Content-Type": "application/json"
             }
             
             # Calculate amount (plan price)
@@ -1931,7 +1825,7 @@ class SubscriptionService:
             if response_data.get('status') and response_data.get('data'):
                 transaction_data = response_data['data']
                 
-                # Create Payment record
+                # Create Payment record for tracking
                 from apps.payment.models import Payment
                 payment = Payment.objects.create(
                     plan=subscription.plan,
@@ -1945,34 +1839,36 @@ class SubscriptionService:
                 
                 if transaction_data.get('status') == 'success':
                     # Extend subscription by one billing period
-                    self._extend_subscription_period(subscription)
+                    new_end_date = subscription.end_date
+                    if subscription.plan.billing_period == 'monthly':
+                        from dateutil.relativedelta import relativedelta
+                        new_end_date = subscription.end_date + relativedelta(months=1)
+                    elif subscription.plan.billing_period == 'quarterly':
+                        new_end_date = subscription.end_date + relativedelta(months=3)
+                    elif subscription.plan.billing_period == 'biannual':
+                        new_end_date = subscription.end_date + relativedelta(months=6)
+                    elif subscription.plan.billing_period == 'annual':
+                        new_end_date = subscription.end_date + relativedelta(years=1)
                     
-                    # Update auto-renewal for next cycle
-                    self._update_auto_renewal_for_next_cycle(auto_renewal, subscription)
+                    subscription.end_date = new_end_date
+                    subscription.status = 'active'
+                    subscription.save()
                     
-                    logger.info(f"Paystack auto-renewal successful for subscription {subscription.id}")
+                    logger.info(f"Paystack direct charge successful for subscription {subscription.id}")
                     return {
                         'status': 'success',
                         'message': 'Auto-renewal successful',
                         'payment_id': str(payment.id),
                         'transaction_id': transaction_data.get('reference'),
                         'amount': str(amount),
-                        'new_end_date': subscription.end_date.isoformat(),
+                        'new_end_date': new_end_date.isoformat(),
                         'next_renewal_date': auto_renewal.next_renewal_date.isoformat() if auto_renewal.next_renewal_date else None
                     }
                 else:
-                    # Payment failed
-                    auto_renewal.failure_count += 1
-                    if auto_renewal.failure_count >= auto_renewal.max_failures:
-                        auto_renewal.status = 'failed'
-                        logger.warning(f"Auto-renewal {auto_renewal.id} marked as failed after {auto_renewal.failure_count} attempts")
-                    auto_renewal.save()
-                    
                     return {
                         'status': 'failed',
                         'message': f"Payment failed: {transaction_data.get('gateway_response', 'Unknown error')}",
-                        'payment_id': str(payment.id),
-                        'failure_count': auto_renewal.failure_count
+                        'payment_id': str(payment.id)
                     }
             else:
                 error_msg = response_data.get('message', 'Auto-renewal payment failed')
@@ -2529,44 +2425,50 @@ class AutoRenewalService:
 
     @transaction.atomic
     def process_due_auto_renewals(self) -> Dict[str, Any]:
-        """Process all due auto-renewals"""
+        """Process all due auto-renewals using RecurringToken and server-side charge."""
         try:
             due_renewals = AutoRenewal.objects.filter(
                 status='active',
                 next_renewal_date__lte=timezone.now()
             ).select_related('plan', 'subscription')
 
-            processed = 0
-            succeeded = 0
-            failed = 0
-            skipped = 0
-
+            processed = succeeded = failed = skipped = 0
             for auto_renewal in due_renewals:
-                result = self.process_auto_renewal(str(auto_renewal.id))
+                subscription = auto_renewal.subscription
+                token = getattr(subscription, 'recurring_token', None)
+                if not token or not token.is_active:
+                    self._audit_log(subscription, 'recurring_charge_failed', details={'reason': 'No active recurring token'})
+                    skipped += 1
+                    continue
+                amount = auto_renewal.plan.price
+                user = auto_renewal.user_id
+                if token.provider == 'paystack':
+                    result = self._paystack_server_charge(subscription, amount, token, user)
+                elif token.provider == 'flutterwave':
+                    result = self._flutterwave_server_charge(subscription, amount, token, user)
+                else:
+                    self._audit_log(subscription, 'recurring_charge_failed', details={'reason': 'unknown provider'})
+                    skipped += 1
+                    continue
                 processed += 1
-                
                 if result['status'] == 'success':
                     succeeded += 1
-                elif result['status'] == 'failed' or result['status'] == 'error':
-                    failed += 1
+                    # Extend subscription and log
+                    SubscriptionService().extend_subscription(str(subscription.id), user=user)
+                    auto_renewal.failure_count = 0
+                    auto_renewal.last_renewal_at = timezone.now()
+                    auto_renewal.save(update_fields=["failure_count", "last_renewal_at"])
                 else:
-                    skipped += 1
-
+                    failed += 1
+                    auto_renewal.failure_count += 1
+                    if auto_renewal.failure_count >= auto_renewal.max_failures:
+                        auto_renewal.status = 'paused'
+                    auto_renewal.save(update_fields=["failure_count", "status"])
             logger.info(f"Processed {processed} auto-renewals: {succeeded} succeeded, {failed} failed, {skipped} skipped")
-            return {
-                'status': 'success',
-                'processed': processed,
-                'succeeded': succeeded,
-                'failed': failed,
-                'skipped': skipped
-            }
-
+            return {'status': 'success', 'processed': processed, 'succeeded': succeeded, 'failed': failed, 'skipped': skipped}
         except Exception as e:
             logger.error(f"Processing due auto-renewals failed: {str(e)}")
-            return {
-                'status': 'error',
-                'message': str(e)
-            }
+            return {'status': 'error', 'message': str(e)}
 
     def _handle_deprecated_plan(self, auto_renewal: AutoRenewal) -> Dict[str, Any]:
         """Handle auto-renewal when plan is deprecated"""

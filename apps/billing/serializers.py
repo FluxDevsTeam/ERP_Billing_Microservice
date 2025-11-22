@@ -1,7 +1,7 @@
 # apps/billing/serializers.py
 from rest_framework import serializers
 from django.utils import timezone
-from .models import Plan, Subscription, AuditLog, TrialUsage, AutoRenewal
+from .models import Plan, Subscription, AuditLog, TrialUsage, AutoRenewal, RecurringToken
 from apps.payment.models import Payment
 import logging
 from .period_calculator import PeriodCalculator
@@ -25,12 +25,23 @@ class PlanSerializer(serializers.ModelSerializer):
         return PeriodCalculator.get_period_display(obj.billing_period)
 
 
+class RecurringTokenSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = RecurringToken
+        fields = [
+            'provider', 'last4', 'card_brand', 'email', 'is_active', 'created_at', 'updated_at'
+        ]
+        read_only_fields = fields
+
+
 class SubscriptionSerializer(serializers.ModelSerializer):
     plan = PlanSerializer(read_only=True)
     scheduled_plan = PlanSerializer(read_only=True)
+    recurring_token = RecurringTokenSerializer(read_only=True)
     remaining_days = serializers.SerializerMethodField()
     in_grace_period = serializers.SerializerMethodField()
     billing_period_display = serializers.SerializerMethodField()
+    payment_method_update_url = serializers.SerializerMethodField()
 
     class Meta:
         model = Subscription
@@ -39,12 +50,13 @@ class SubscriptionSerializer(serializers.ModelSerializer):
             'created_at', 'updated_at', 'suspended_at', 'canceled_at', 'auto_renew',
             'trial_end_date', 'last_payment_date', 'next_payment_date',
             'payment_retry_count', 'max_payment_retries', 'remaining_days', 'in_grace_period',
-            'is_first_time_subscription', 'trial_used', 'billing_period_display'
+            'is_first_time_subscription', 'trial_used', 'billing_period_display',
+            'recurring_token', 'payment_method_update_url'
         ]
         read_only_fields = [
             'status', 'start_date', 'end_date', 'created_at', 'updated_at',
             'suspended_at', 'canceled_at', 'last_payment_date', 'next_payment_date',
-            'payment_retry_count', 'remaining_days', 'in_grace_period'
+            'payment_retry_count', 'remaining_days', 'in_grace_period', 'recurring_token', 'payment_method_update_url'
         ]
 
     def get_billing_period_display(self, obj):
@@ -55,6 +67,16 @@ class SubscriptionSerializer(serializers.ModelSerializer):
 
     def get_in_grace_period(self, obj):
         return obj.is_in_grace_period()
+
+    def get_payment_method_update_url(self, obj):
+        token = getattr(obj, 'recurring_token', None)
+        if not token:
+            return None
+        if token.provider == 'paystack' and token.paystack_subscription_code:
+            return f'https://dashboard.paystack.com/#/subscriptions/{token.paystack_subscription_code}'
+        elif token.provider == 'flutterwave':
+            return None  # Frontend should trigger update card pay flow
+        return None
 
 
 class SubscriptionCreateSerializer(serializers.Serializer):
