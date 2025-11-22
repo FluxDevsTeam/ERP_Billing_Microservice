@@ -87,7 +87,7 @@ class SubscriptionView(viewsets.ModelViewSet):
             return AuditLogSerializer
         return SubscriptionSerializer
 
-    @swagger_helper("Subscriptions", "create")
+    @swagger_helper("Subscriptions", "create_subscription")
     def create(self, request, *args, **kwargs):
         try:
             serializer = self.get_serializer(data=request.data)
@@ -154,7 +154,7 @@ class SubscriptionView(viewsets.ModelViewSet):
             return Response({'error': 'Subscription creation failed'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=False, methods=['post'], url_path='activate-trial', permission_classes=[IsAuthenticated])
-    @swagger_helper("Subscriptions", "create")
+    @swagger_helper("Subscriptions", "activate_trial_subscription")
     def activate_trial(self, request):
         """
         Activate a 7-day free trial for a tenant/user before purchasing.
@@ -229,7 +229,7 @@ class SubscriptionView(viewsets.ModelViewSet):
 
 
     @action(detail=True, methods=['post'], url_path='suspend')
-    @swagger_helper("Subscriptions", "suspend_subscription")
+    @swagger_helper("Subscriptions", "suspend_subscription_action")
     def suspend_subscription(self, request, pk=None):
         try:
             serializer = self.get_serializer(data={**request.data, 'subscription_id': pk})
@@ -271,7 +271,7 @@ class SubscriptionView(viewsets.ModelViewSet):
 
 
     @action(detail=False, methods=['post'], url_path='check-expired')
-    @swagger_helper("Subscriptions", "check_expired_subscriptions")
+    @swagger_helper("Subscriptions", "check_expired_subscriptions_action")
     def check_expired_subscriptions(self, request):
         try:
             role = getattr(self.request, 'role', None)
@@ -291,7 +291,7 @@ class SubscriptionView(viewsets.ModelViewSet):
                             status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=True, methods=['get'], url_path='audit-logs')
-    @swagger_helper("Subscriptions", "get_audit_logs")
+    @swagger_helper("Subscriptions", "get_subscription_audit_logs")
     def get_audit_logs(self, request, pk=None):
         try:
             subscription = self.get_object()
@@ -312,7 +312,7 @@ class SubscriptionView(viewsets.ModelViewSet):
 
 
 
-    @swagger_helper("Subscriptions", "list")
+    @swagger_helper("Subscriptions", "list_subscriptions")
     def list(self, request, *args, **kwargs):
         try:
             queryset = self.get_queryset()
@@ -328,7 +328,7 @@ class SubscriptionView(viewsets.ModelViewSet):
             print(f"SubscriptionView.list: Unexpected error - {str(e)}")
             return Response({'error': 'Failed to retrieve subscriptions'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-    @swagger_helper("Subscriptions", "retrieve")
+    @swagger_helper("Subscriptions", "retrieve_subscription")
     def retrieve(self, request, *args, **kwargs):
         try:
             print(f"SubscriptionView.retrieve: Retrieving subscription id={kwargs.get('pk')}")
@@ -337,7 +337,7 @@ class SubscriptionView(viewsets.ModelViewSet):
             print(f"SubscriptionView.retrieve: Unexpected error - {str(e)}")
             return Response({'error': 'Failed to retrieve subscription'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-    @swagger_helper("Subscriptions", "partial_update")
+    @swagger_helper("Subscriptions", "partial_update_subscription")
     def partial_update(self, request, *args, **kwargs):
         try:
             print(f"SubscriptionView.partial_update: Partially updating subscription id={kwargs.get('pk')}")
@@ -347,7 +347,7 @@ class SubscriptionView(viewsets.ModelViewSet):
             return Response({'error': 'Subscription partial update failed'},
                             status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-    @swagger_helper("Subscriptions", "update")
+    @swagger_helper("Subscriptions", "update_subscription")
     def update(self, request, *args, **kwargs):
         try:
             print(f"SubscriptionView.update: Updating subscription id={kwargs.get('pk')}")
@@ -356,7 +356,7 @@ class SubscriptionView(viewsets.ModelViewSet):
             print(f"SubscriptionView.update: Unexpected error - {str(e)}")
             return Response({'error': 'Subscription update failed'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-    @swagger_helper("Subscriptions", "destroy")
+    @swagger_helper("Subscriptions", "delete_subscription")
     def destroy(self, request, *args, **kwargs):
         try:
             print(f"SubscriptionView.destroy: Deleting subscription id={kwargs.get('pk')}")
