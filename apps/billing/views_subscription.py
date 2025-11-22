@@ -9,6 +9,7 @@ from django.core.exceptions import ValidationError
 from django.utils import timezone
 import uuid
 import logging
+from django_filters import rest_framework as filters
 
 logger = logging.getLogger(__name__)
 
@@ -25,11 +26,26 @@ from .services import SubscriptionService
 from api.email_service import send_email_via_service
 
 
+class SubscriptionFilter(filters.FilterSet):
+    auto_renew = filters.BooleanFilter(method='filter_auto_renew')
+
+    class Meta:
+        model = Subscription
+        fields = ['tenant_id', 'plan', 'status']
+
+    def filter_auto_renew(self, queryset, name, value):
+        # Get tenant_ids where auto_renew_enabled matches the value
+        tenant_ids = TenantBillingPreferences.objects.filter(
+            auto_renew_enabled=value
+        ).values_list('tenant_id', flat=True)
+        return queryset.filter(tenant_id__in=tenant_ids)
+
+
 class SubscriptionView(viewsets.ModelViewSet):
     queryset = Subscription.objects.all()
     filter_backends = [DjangoFilterBackend, SearchFilter]
     search_fields = ['tenant_id']
-    filterset_fields = ['tenant_id', 'plan', 'status', 'auto_renew']
+    filterset_class = SubscriptionFilter
 
     def get_queryset(self):
         user = self.request.user

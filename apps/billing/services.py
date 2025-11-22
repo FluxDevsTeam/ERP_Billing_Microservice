@@ -323,8 +323,23 @@ class SubscriptionService:
             if subscription.status in ['canceled', 'suspended']:
                 raise ValidationError("Cannot toggle auto-renew for canceled or suspended subscription")
 
-            subscription.auto_renew = auto_renew
-            subscription.save()
+            # Update TenantBillingPreferences instead of subscription
+            preferences, created = TenantBillingPreferences.objects.get_or_create(
+                tenant_id=subscription.tenant_id,
+                defaults={
+                    'user_id': str(user) if user else None,
+                    'auto_renew_enabled': auto_renew,
+                    'renewal_status': 'active' if auto_renew else 'paused',
+                    'preferred_plan': subscription.plan,
+                    'subscription_expiry_date': subscription.end_date,
+                    'next_renewal_date': subscription.end_date if auto_renew else None,
+                }
+            )
+            if not created:
+                preferences.auto_renew_enabled = auto_renew
+                preferences.renewal_status = 'active' if auto_renew else 'paused'
+                preferences.next_renewal_date = subscription.end_date if auto_renew else None
+                preferences.save()
 
             # Update AutoRenewal model for consistency
             try:
@@ -2062,7 +2077,7 @@ class UsageMonitorService:
                 'trial_end_date': subscription.trial_end_date.isoformat() if subscription.trial_end_date else None,
                 'end_date': subscription.end_date.isoformat() if subscription.end_date else None,
                 'remaining_days': subscription.get_remaining_days(),
-                'auto_renew': subscription.auto_renew
+                'auto_renew': subscription.tenant_billing_preferences.auto_renew_enabled if subscription.tenant_billing_preferences else False
             }
 
         except Subscription.DoesNotExist:
