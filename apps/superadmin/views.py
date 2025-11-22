@@ -71,10 +71,13 @@ class SuperadminPortalViewSet(viewsets.ViewSet):
                 start_date__range=(start_date, end_date)
             ).count()
             # Count active subscriptions that have billing preferences (indicating they were converted from trials)
+            from django.db.models import Exists, OuterRef
+            from apps.billing.models import TenantBillingPreferences
             trials_converted = Subscription.objects.filter(
                 status='active',
-                tenant_billing_preferences__isnull=False,
                 start_date__range=(start_date - timedelta(days=7), end_date)  # Allow 7-day conversion window
+            ).filter(
+                Exists(TenantBillingPreferences.objects.filter(tenant_id=OuterRef('tenant_id')))
             ).count()
             trial_conversion_rate = (trials_converted / trials_started * 100) if trials_started else 0
 
