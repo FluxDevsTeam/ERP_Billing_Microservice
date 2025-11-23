@@ -18,7 +18,7 @@ class PlanView(viewsets.ModelViewSet):
     serializer_class = PlanSerializer
     permission_classes = [IsAuthenticated]
     filter_backends = [DjangoFilterBackend, SearchFilter]
-    search_fields = ['name']
+    search_fields = ['name', 'industry']
     filterset_fields = ['id', 'name', 'price', 'industry', 'is_active', 'discontinued']
 
     def get_permissions(self):

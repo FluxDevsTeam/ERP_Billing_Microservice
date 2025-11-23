@@ -15,10 +15,9 @@ urlpatterns = [
 
     # SubscriptionView
     path('subscriptions/', SubscriptionView.as_view({'get': 'list', 'post': 'create'}), name='subscription_list_create'),
-    path('subscriptions/<uuid:pk>/', SubscriptionView.as_view({'get': 'retrieve', 'put': 'update', 'patch': 'partial_update', 'delete': 'destroy'}), name='subscription_detail'),
+    path('subscriptions/<uuid:pk>/', SubscriptionView.as_view({'get': 'retrieve', 'patch': 'partial_update', 'delete': 'destroy'}), name='subscription_detail'),
     path('subscriptions/<uuid:pk>/suspend/', SubscriptionView.as_view({'post': 'suspend_subscription'}), name='subscription_suspend'),
     path('subscriptions/<uuid:pk>/audit-logs/', SubscriptionView.as_view({'get': 'get_audit_logs'}), name='subscription_audit_logs'),
-    # path('subscriptions/check-expired/', SubscriptionView.as_view({'post': 'check_expired_subscriptions'}), name='subscription_check_expired'),
     path('subscriptions/activate-trial/', SubscriptionView.as_view({'post': 'activate_trial'}), name='subscription_activate_trial'),
 
     # CustomerPortalViewSet

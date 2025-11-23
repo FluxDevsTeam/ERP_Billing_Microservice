@@ -58,14 +58,10 @@ class Plan(models.Model):
         ("Education", "Education"),
         ("Technology", "Technology"),
         ("Retail", "Retail"),
-        ("Hospitality", "Hospitality"),
         ("Agriculture", "Agriculture"),
-        ("Transport and Logistics", "Transport and Logistics"),
         ("Real Estate", "Real Estate"),
-        ("Energy and Utilities", "Energy and Utilities"),
-        ("Media and Entertainment", "Media and Entertainment"),
-        ("Government", "Government"),
-        ("Other", "Other"),
+        ("Supermarket", "Supermarket"),
+        ("Warehouse", "Warehouse"),
     )
 
     name = models.CharField(max_length=100)

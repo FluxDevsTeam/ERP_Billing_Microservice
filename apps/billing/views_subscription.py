@@ -27,18 +27,11 @@ from api.email_service import send_email_via_service
 
 
 class SubscriptionFilter(filters.FilterSet):
-    auto_renew = filters.BooleanFilter(method='filter_auto_renew')
+    auto_renew = filters.BooleanFilter(field_name='tenant_billing_preferences__auto_renew_enabled')
 
     class Meta:
         model = Subscription
         fields = ['tenant_id', 'plan', 'status']
-
-    def filter_auto_renew(self, queryset, name, value):
-        # Get tenant_ids where auto_renew_enabled matches the value
-        tenant_ids = TenantBillingPreferences.objects.filter(
-            auto_renew_enabled=value
-        ).values_list('tenant_id', flat=True)
-        return queryset.filter(tenant_id__in=tenant_ids)
 
 
 class SubscriptionView(viewsets.ModelViewSet):
@@ -314,19 +307,7 @@ class SubscriptionView(viewsets.ModelViewSet):
 
     @swagger_helper("Subscriptions", "list_subscriptions")
     def list(self, request, *args, **kwargs):
-        try:
-            queryset = self.get_queryset()
-            serializer = self.get_serializer(queryset, many=True)
-            result = {
-                'count': queryset.count(),
-                'results': serializer.data
-            }
-            print(f"SubscriptionView.list: Listed {queryset.count()} subscriptions")
-            return Response(result)
-
-        except Exception as e:
-            print(f"SubscriptionView.list: Unexpected error - {str(e)}")
-            return Response({'error': 'Failed to retrieve subscriptions'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        return super().list(request, *args, **kwargs)
 
     @swagger_helper("Subscriptions", "retrieve_subscription")
     def retrieve(self, request, *args, **kwargs):
@@ -346,15 +327,6 @@ class SubscriptionView(viewsets.ModelViewSet):
             print(f"SubscriptionView.partial_update: Unexpected error - {str(e)}")
             return Response({'error': 'Subscription partial update failed'},
                             status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-    @swagger_helper("Subscriptions", "update_subscription")
-    def update(self, request, *args, **kwargs):
-        try:
-            print(f"SubscriptionView.update: Updating subscription id={kwargs.get('pk')}")
-            return super().update(request, *args, **kwargs)
-        except Exception as e:
-            print(f"SubscriptionView.update: Unexpected error - {str(e)}")
-            return Response({'error': 'Subscription update failed'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @swagger_helper("Subscriptions", "delete_subscription")
     def destroy(self, request, *args, **kwargs):
