@@ -254,12 +254,27 @@ class AutoRenewToggleSerializer(serializers.Serializer):
 
 
 class AuditLogSerializer(serializers.ModelSerializer):
+    subscription_details = serializers.SerializerMethodField()
+
     class Meta:
         model = AuditLog
         fields = [
-            'id', 'action', 'user', 'details', 'timestamp', 'ip_address'
+            'id', 'action', 'user', 'details', 'timestamp', 'ip_address', 'subscription_details'
         ]
         read_only_fields = ['id', 'timestamp']
+
+    def get_subscription_details(self, obj):
+        if obj.subscription:
+            return {
+                'id': str(obj.subscription.id),
+                'tenant_id': str(obj.subscription.tenant_id),
+                'status': obj.subscription.status,
+                'plan_name': obj.subscription.plan.name if obj.subscription.plan else None,
+                'plan_price': float(obj.subscription.plan.price) if obj.subscription.plan else None,
+                'start_date': obj.subscription.start_date.isoformat() if obj.subscription.start_date else None,
+                'end_date': obj.subscription.end_date.isoformat() if obj.subscription.end_date else None,
+            }
+        return None
 
 
 class PaymentSerializer(serializers.ModelSerializer):
