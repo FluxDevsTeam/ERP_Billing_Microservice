@@ -1,4 +1,3 @@
-# billing_microservice/urls.py
 from django.urls import path
 from .views_plan import PlanView
 from .views_subscription import SubscriptionView

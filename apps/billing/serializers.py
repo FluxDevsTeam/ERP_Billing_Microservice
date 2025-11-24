@@ -82,17 +82,16 @@ class SubscriptionSerializer(serializers.ModelSerializer):
 
 
 class SubscriptionCreateSerializer(serializers.Serializer):
+    tenant_id = serializers.UUIDField()
     plan_id = serializers.UUIDField()
-    start_date = serializers.DateTimeField(required=False)
-    end_date = serializers.DateTimeField(required=False)
     auto_renew = serializers.BooleanField(default=True)
 
     def validate(self, data):
         user = self.context['request'].user
-        tenant_id = getattr(user, 'tenant', None)
-        if not tenant_id:
-            logger.warning(f"Subscription creation failed: No tenant_id associated with user {user.email}")
-            raise serializers.ValidationError("No tenant associated with user")
+        tenant_id = data['tenant_id']
+
+        # Optional: Check if user has permission to create for this tenant
+        # For now, allow any authenticated user to specify tenant_id
 
         # Check existing subscription
         existing_sub = Subscription.objects.filter(
@@ -117,7 +116,6 @@ class SubscriptionCreateSerializer(serializers.Serializer):
 
         # Trial abuse prevention (checked at service level with machine_number)
 
-        data['tenant_id'] = tenant_id
         return data
 
 

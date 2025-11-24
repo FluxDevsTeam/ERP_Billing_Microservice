@@ -120,15 +120,33 @@ class SubscriptionView(viewsets.ModelViewSet):
                 preferences.next_renewal_date = subscription.end_date if auto_renew else None
                 preferences.save()
 
-            # Send welcome email
-            email_data = {
-                'user_email': request.user.email,
-                'email_type': 'confirmation',
-                'subject': 'Welcome to Your New Subscription',
-                'message': f'Your subscription to {subscription.plan.name} plan has been created successfully.',
-                'action': 'Subscription Created'
-            }
-            send_email_via_service(email_data)
+            # Get tenant CEO email for notification
+            ceo_email = None
+            try:
+                client = IdentityServiceClient(request=request)
+                users = client.get_users(tenant_id=str(tenant_id))
+                if users and isinstance(users, list):
+                    # Find the first user with role 'ceo'
+                    ceo_user = next((user for user in users if user.get('role') == 'ceo'), None)
+                    if ceo_user:
+                        ceo_email = ceo_user.get('email')
+                print(f"SubscriptionView.create: Tenant CEO email - {ceo_email}")
+            except Exception as e:
+                print(f"SubscriptionView.create: Error fetching tenant users - {str(e)}")
+                ceo_email = None
+
+            # Send welcome email to tenant CEO
+            if ceo_email:
+                email_data = {
+                    'user_email': ceo_email,
+                    'email_type': 'confirmation',
+                    'subject': 'Welcome to Your New Subscription',
+                    'message': f'Your subscription to {subscription.plan.name} plan has been created successfully.',
+                    'action': 'Subscription Created'
+                }
+                send_email_via_service(email_data)
+            else:
+                print(f"SubscriptionView.create: No CEO email found for tenant {tenant_id}, skipping email notification")
 
             serializer = SubscriptionSerializer(subscription)
             print(f"SubscriptionView.create: Subscription created for tenant_id={tenant_id}, plan_id={plan_id}")
