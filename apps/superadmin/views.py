@@ -109,32 +109,51 @@ class SuperadminPortalViewSet(viewsets.ViewSet):
 
             # Subscription status breakdown
             total_subscription_count = Subscription.objects.count()
-            subscription_status_breakdown = Subscription.objects.values('status').annotate(
-                count=Count('id'),
-                percentage=Case(
-                    When(count__gt=0, then=F('count') * 100 / total_subscription_count),
-                    default=0,
-                    output_field=DecimalField()
-                ) if total_subscription_count > 0 else Value(0, output_field=DecimalField())
-            ).order_by('-count')
+            if total_subscription_count > 0:
+                subscription_status_breakdown = []
+                for item in Subscription.objects.values('status').annotate(count=Count('id')).order_by('-count'):
+                    percentage = (item['count'] * 100) / total_subscription_count if item['count'] > 0 else 0
+                    subscription_status_breakdown.append({
+                        'status': item['status'],
+                        'count': item['count'],
+                        'percentage': float(percentage)
+                    })
+            else:
+                subscription_status_breakdown = []
 
             # Active subscriptions by plan
-            active_by_plan = Subscription.objects.filter(
+            active_by_plan = []
+            for item in Subscription.objects.filter(
                 status='active',
                 end_date__gte=now
-            ).values('plan__name', 'plan__tier_level').annotate(
-                count=Count('id'),
-                total_mrr=Sum(
-                    Case(
-                        When(plan__billing_period='monthly', then=F('plan__price')),
-                        When(plan__billing_period='quarterly', then=F('plan__price')/3),
-                        When(plan__billing_period='biannual', then=F('plan__price')/6),
-                        When(plan__billing_period='annual', then=F('plan__price')/12),
-                        default=0,
-                        output_field=DecimalField()
-                    )
-                )
-            ).order_by('-total_mrr')
+            ).values('plan__name', 'plan__tier_level', 'plan__billing_period', 'plan__price').annotate(
+                count=Count('id')
+            ).order_by('-count'):
+                # Calculate MRR based on billing period
+                price = float(item['plan__price'])
+                period = item['plan__billing_period']
+                if period == 'monthly':
+                    mrr = price
+                elif period == 'quarterly':
+                    mrr = price / 3
+                elif period == 'biannual':
+                    mrr = price / 6
+                elif period == 'annual':
+                    mrr = price / 12
+                else:
+                    mrr = 0
+
+                total_mrr = mrr * item['count']
+
+                active_by_plan.append({
+                    'plan__name': item['plan__name'],
+                    'plan__tier_level': item['plan__tier_level'],
+                    'count': item['count'],
+                    'total_mrr': float(total_mrr)
+                })
+
+            # Sort by total_mrr descending
+            active_by_plan.sort(key=lambda x: x['total_mrr'], reverse=True)
 
             # 5. CHURN ANALYSIS - Enhanced
             # Churn rate calculation (canceled in period / active at start of period)
@@ -204,20 +223,24 @@ class SuperadminPortalViewSet(viewsets.ViewSet):
             payment_failure_rate = (failed_payments / total_payments_period * 100) if total_payments_period else 0
 
             # Payment methods performance
-            payment_methods_performance = Payment.objects.filter(
+            payment_methods_performance = []
+            for item in Payment.objects.filter(
                 payment_date__range=(start_date, end_date)
             ).values('provider').annotate(
                 total_count=Count('id'),
                 success_count=Count('id', filter=Q(status='completed')),
                 failed_count=Count('id', filter=Q(status='failed')),
-                total_amount=Coalesce(Sum('amount', filter=Q(status='completed')), 0),
-                success_rate=Case(
-                    When(total_count__gt=0,
-                         then=Count('id', filter=Q(status='completed')) * 100 / F('total_count')),
-                    default=0,
-                    output_field=DecimalField()
-                )
-            ).order_by('-total_count')
+                total_amount=Coalesce(Sum('amount', filter=Q(status='completed')), 0)
+            ).order_by('-total_count'):
+                success_rate = (item['success_count'] * 100) / item['total_count'] if item['total_count'] > 0 else 0
+                payment_methods_performance.append({
+                    'provider': item['provider'],
+                    'total_count': item['total_count'],
+                    'success_count': item['success_count'],
+                    'failed_count': item['failed_count'],
+                    'total_amount': float(item['total_amount'] or 0),
+                    'success_rate': float(success_rate)
+                })
 
             # 8. OUTSTANDING RECEIVABLES
             # Pending payments that are overdue (payment_date > 7 days ago)
