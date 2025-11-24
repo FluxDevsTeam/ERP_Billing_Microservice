@@ -5,7 +5,6 @@ from rest_framework.response import Response
 from django.utils import timezone
 from django.db.models import Q, Exists, OuterRef
 from django.db.models.functions import TruncMonth, TruncDay
-from django.db.models import Exists, OuterRef, DecimalField
 from apps.billing.models import Subscription, AuditLog, Plan, TenantBillingPreferences
 from apps.payment.models import Payment, WebhookEvent
 from apps.payment.services import PaymentService
@@ -132,34 +131,41 @@ class SuperadminPortalViewSet(viewsets.ViewSet):
 
             # Active subscriptions by plan
             active_by_plan = []
-            for item in Subscription.objects.filter(
+            for plan_name in Subscription.objects.filter(
                 status='active',
                 end_date__gte=now
-            ).values('plan__name', 'plan__tier_level', 'plan__billing_period', 'plan__price').annotate(
-                count=Count('id')
-            ).order_by('-count'):
-                # Calculate MRR based on billing period
-                price = float(item['plan__price'])
-                period = item['plan__billing_period']
-                if period == 'monthly':
-                    mrr = price
-                elif period == 'quarterly':
-                    mrr = price / 3
-                elif period == 'biannual':
-                    mrr = price / 6
-                elif period == 'annual':
-                    mrr = price / 12
-                else:
-                    mrr = 0
+            ).values('plan__name').distinct():
+                plan_subs = Subscription.objects.filter(
+                    status='active',
+                    end_date__gte=now,
+                    plan__name=plan_name['plan__name']
+                ).select_related('plan')
+                count = plan_subs.count()
+                if count > 0:
+                    # Get plan details from first subscription
+                    first_sub = plan_subs.first()
+                    plan = first_sub.plan
+                    price = float(plan.price)
+                    period = plan.billing_period
+                    if period == 'monthly':
+                        mrr = price
+                    elif period == 'quarterly':
+                        mrr = price / 3
+                    elif period == 'biannual':
+                        mrr = price / 6
+                    elif period == 'annual':
+                        mrr = price / 12
+                    else:
+                        mrr = 0
 
-                total_mrr = mrr * item['count']
+                    total_mrr = mrr * count
 
-                active_by_plan.append({
-                    'plan__name': item['plan__name'],
-                    'plan__tier_level': item['plan__tier_level'],
-                    'count': item['count'],
-                    'total_mrr': float(total_mrr)
-                })
+                    active_by_plan.append({
+                        'plan__name': plan_name['plan__name'],
+                        'plan__tier_level': plan.tier_level,
+                        'count': count,
+                        'total_mrr': float(total_mrr)
+                    })
 
             # Sort by total_mrr descending
             active_by_plan.sort(key=lambda x: x['total_mrr'], reverse=True)
