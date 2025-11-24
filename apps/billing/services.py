@@ -175,8 +175,7 @@ class SubscriptionService:
             end_date=None,  # Let save() calculate it first
             next_payment_date=trial_end_date if is_trial else None,
             is_first_time_subscription=not previous_subscription,
-            trial_used=is_trial,
-            auto_renew=auto_renew
+            trial_used=is_trial
         )
         subscription.save()  # This will calculate end_date based on billing_period
         
