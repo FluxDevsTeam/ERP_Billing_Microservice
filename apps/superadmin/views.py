@@ -13,6 +13,7 @@ from .serializers import AnalyticsSerializer, WebhookEventSerializer
 from datetime import datetime, timedelta
 from .permissions import IsSuperuser
 from .utils import swagger_helper
+from .pagination import CustomPagination
 import logging
 
 logger = logging.getLogger(__name__)
@@ -273,14 +274,12 @@ class SuperadminPortalViewSet(viewsets.ViewSet):
                 end_date = timezone.datetime.fromisoformat(end_date)
                 queryset = queryset.filter(timestamp__range=(start_date, end_date))
 
-            audit_logs = queryset[:200]  # Limit to 200 most recent
-            serializer = AuditLogSerializer(audit_logs, many=True)
+            # Apply pagination
+            paginator = CustomPagination()
+            paginated_queryset = paginator.paginate_queryset(queryset, request)
+            serializer = AuditLogSerializer(paginated_queryset, many=True)
 
-            return Response({
-                'count': audit_logs.count(),
-                'total_filtered': queryset.count(),
-                'results': serializer.data
-            })
+            return paginator.get_paginated_response(serializer.data)
 
         except Exception as e:
             return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
