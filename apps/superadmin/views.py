@@ -3,8 +3,9 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from django.utils import timezone
-from django.db.models import Sum, Count, F, Q
+from django.db.models import Sum, Count, F, Q, Case, When
 from django.db.models.functions import TruncMonth, TruncDay
+from django.db.models import Exists, OuterRef, DecimalField
 from apps.billing.models import Subscription, AuditLog, Plan
 from apps.payment.models import Payment, WebhookEvent
 from apps.payment.services import PaymentService
@@ -26,6 +27,7 @@ class SuperadminPortalViewSet(viewsets.ViewSet):
     @action(detail=False, methods=['get'], url_path='analytics')
     def get_analytics(self, request):
         try:
+            # Date range handling
             start_date = request.query_params.get('start_date')
             end_date = request.query_params.get('end_date')
             if start_date and end_date:
@@ -35,189 +37,445 @@ class SuperadminPortalViewSet(viewsets.ViewSet):
                 end_date = timezone.now()
                 start_date = end_date - timezone.timedelta(days=30)
 
-            # Monthly Recurring Revenue (MRR)
+            now = timezone.now()
+
+            # ============================================================================
+            # FINANCIAL METRICS
+            # ============================================================================
+
+            # 1. REVENUE METRICS
+            # Total Revenue (all completed payments)
+            total_revenue_all_time = Payment.objects.filter(
+                status='completed'
+            ).aggregate(total=Sum('amount'))['total'] or 0
+
+            # Revenue in period
+            period_revenue = Payment.objects.filter(
+                payment_date__range=(start_date, end_date),
+                status='completed'
+            ).aggregate(total=Sum('amount'))['total'] or 0
+
+            # Revenue by payment status
+            revenue_by_status = Payment.objects.filter(
+                payment_date__range=(start_date, end_date)
+            ).values('status').annotate(
+                total_amount=Sum('amount'),
+                count=Count('id')
+            ).order_by('status')
+
+            # 2. MONTHLY RECURRING REVENUE (MRR) - Enhanced
             active_subscriptions = Subscription.objects.filter(
                 status='active',
-                end_date__gte=timezone.now()
+                end_date__gte=now
             ).select_related('plan')
 
-            # Calculate MRR based on billing_period
             mrr = 0
+            mrr_breakdown = {'monthly': 0, 'quarterly': 0, 'biannual': 0, 'annual': 0}
             for subscription in active_subscriptions:
                 plan = subscription.plan
+                if not plan:
+                    continue
                 price = float(plan.price)
-                if plan.billing_period == 'monthly':
-                    mrr += price  # Price is already monthly
-                elif plan.billing_period == 'quarterly':
-                    mrr += price / 3  # Convert quarterly price to monthly
-                elif plan.billing_period == 'biannual':
-                    mrr += price / 6  # Convert biannual price to monthly
-                elif plan.billing_period == 'annual':
-                    mrr += price / 12  # Convert annual price to monthly
+                period = plan.billing_period
 
-            # Churn Rate (canceled in period / total active at start of period)
+                if period == 'monthly':
+                    mrr += price
+                    mrr_breakdown['monthly'] += price
+                elif period == 'quarterly':
+                    monthly_equivalent = price / 3
+                    mrr += monthly_equivalent
+                    mrr_breakdown['quarterly'] += monthly_equivalent
+                elif period == 'biannual':
+                    monthly_equivalent = price / 6
+                    mrr += monthly_equivalent
+                    mrr_breakdown['biannual'] += monthly_equivalent
+                elif period == 'annual':
+                    monthly_equivalent = price / 12
+                    mrr += monthly_equivalent
+                    mrr_breakdown['annual'] += monthly_equivalent
+
+            # 3. AVERAGE REVENUE PER USER (ARPU)
+            active_customer_count = active_subscriptions.values('tenant_id').distinct().count()
+            arpu = mrr / active_customer_count if active_customer_count else 0
+
+            # 4. CUSTOMER LIFETIME VALUE (CLV) - Estimated
+            avg_subscription_length_months = 12  # Assumption
+            clv = arpu * avg_subscription_length_months
+
+            # ============================================================================
+            # SUBSCRIPTION METRICS
+            # ============================================================================
+
+            # Subscription status breakdown
+            subscription_status_breakdown = Subscription.objects.values('status').annotate(
+                count=Count('id'),
+                percentage=Count('id') * 100.0 / Subscription.objects.count()
+            ).order_by('-count')
+
+            # Active subscriptions by plan
+            active_by_plan = Subscription.objects.filter(
+                status='active',
+                end_date__gte=now
+            ).values('plan__name', 'plan__tier_level').annotate(
+                count=Count('id'),
+                total_mrr=Sum(
+                    Case(
+                        When(plan__billing_period='monthly', then=F('plan__price')),
+                        When(plan__billing_period='quarterly', then=F('plan__price')/3),
+                        When(plan__billing_period='biannual', then=F('plan__price')/6),
+                        When(plan__billing_period='annual', then=F('plan__price')/12),
+                        default=0,
+                        output_field=DecimalField()
+                    )
+                )
+            ).order_by('-total_mrr')
+
+            # 5. CHURN ANALYSIS - Enhanced
+            # Churn rate calculation (canceled in period / active at start of period)
             initial_active = Subscription.objects.filter(
                 status='active',
                 start_date__lte=start_date
             ).count()
-            canceled_subscriptions = Subscription.objects.filter(
+
+            canceled_in_period = Subscription.objects.filter(
                 status='canceled',
                 canceled_at__range=(start_date, end_date)
             ).count()
-            churn_rate = (canceled_subscriptions / initial_active * 100) if initial_active else 0
 
-            # Trial Conversion Rate
-            trials_started = Subscription.objects.filter(
-                status='trial',
-                start_date__range=(start_date, end_date)
-            ).count()
-            # Count active subscriptions that have billing preferences (indicating they were converted from trials)
-            from django.db.models import Exists, OuterRef
-            from apps.billing.models import TenantBillingPreferences
-            trials_converted = Subscription.objects.filter(
-                status='active',
-                start_date__range=(start_date - timedelta(days=7), end_date)  # Allow 7-day conversion window
-            ).filter(
-                Exists(TenantBillingPreferences.objects.filter(tenant_id=OuterRef('tenant_id')))
-            ).count()
-            trial_conversion_rate = (trials_converted / trials_started * 100) if trials_started else 0
+            churn_rate = (canceled_in_period / initial_active * 100) if initial_active else 0
 
-            # Revenue by Plan (completed payments in period)
-            revenue_by_plan = Payment.objects.filter(
-                payment_date__range=(start_date, end_date),
-                status='completed'
+            # Churn by plan
+            churn_by_plan = Subscription.objects.filter(
+                status='canceled',
+                canceled_at__range=(start_date, end_date)
             ).values('plan__name').annotate(
-                total_amount=Sum('amount'),
-                count=Count('id')
-            ).order_by('-total_amount')
+                churn_count=Count('id')
+            ).order_by('-churn_count')
 
-            # Failed Payments Rate
-            total_payments = Payment.objects.filter(
+            # 6. SUBSCRIPTION CHANGES (Upgrades/Downgrades)
+            # Analyze audit logs for plan changes
+            plan_changes = AuditLog.objects.filter(
+                action='plan_changed',
+                timestamp__range=(start_date, end_date)
+            ).values('details').annotate(
+                count=Count('id')
+            )
+
+            upgrades = 0
+            downgrades = 0
+            for change in plan_changes:
+                details = change.get('details', {})
+                if details.get('is_upgrade'):
+                    upgrades += change['count']
+                elif details.get('is_downgrade'):
+                    downgrades += change['count']
+
+            # ============================================================================
+            # PAYMENT METRICS
+            # ============================================================================
+
+            # 7. PAYMENT SUCCESS RATES - Enhanced
+            total_payments_period = Payment.objects.filter(
                 payment_date__range=(start_date, end_date)
             ).count()
+
+            completed_payments = Payment.objects.filter(
+                payment_date__range=(start_date, end_date),
+                status='completed'
+            ).count()
+
             failed_payments = Payment.objects.filter(
                 payment_date__range=(start_date, end_date),
                 status='failed'
             ).count()
-            failed_rate = (failed_payments / total_payments * 100) if total_payments else 0
 
-            # Active Plans Overview
-            active_plans = Plan.objects.filter(
+            pending_payments = Payment.objects.filter(
+                payment_date__range=(start_date, end_date),
+                status='pending'
+            ).count()
+
+            payment_success_rate = (completed_payments / total_payments_period * 100) if total_payments_period else 0
+            payment_failure_rate = (failed_payments / total_payments_period * 100) if total_payments_period else 0
+
+            # Payment methods performance
+            payment_methods_performance = Payment.objects.filter(
+                payment_date__range=(start_date, end_date)
+            ).values('provider').annotate(
+                total_count=Count('id'),
+                success_count=Count('id', filter=Q(status='completed')),
+                failed_count=Count('id', filter=Q(status='failed')),
+                total_amount=Sum('amount', filter=Q(status='completed')),
+                success_rate=Count('id', filter=Q(status='completed')) * 100.0 / Count('id')
+            ).order_by('-total_count')
+
+            # 8. OUTSTANDING RECEIVABLES
+            # Pending payments that are overdue (created > 7 days ago)
+            overdue_threshold = now - timezone.timedelta(days=7)
+            outstanding_receivables = Payment.objects.filter(
+                status='pending',
+                created_at__lt=overdue_threshold
+            ).aggregate(
+                total_amount=Sum('amount'),
+                count=Count('id')
+            )
+
+            # ============================================================================
+            # USER GROWTH AND ENGAGEMENT
+            # ============================================================================
+
+            # 9. USER GROWTH TRENDS
+            # New users by month (last 12 months)
+            user_growth_trends = []
+            for i in range(12):
+                month_start = (now - timezone.timedelta(days=30*i)).replace(day=1, hour=0, minute=0, second=0)
+                month_end = (month_start + timezone.timedelta(days=32)).replace(day=1) - timezone.timedelta(seconds=1)
+
+                new_users = Subscription.objects.filter(
+                    start_date__range=(month_start, month_end)
+                ).values('tenant_id').distinct().count()
+
+                user_growth_trends.append({
+                    'month': month_start.strftime('%Y-%m'),
+                    'new_users': new_users
+                })
+
+            # Total users (unique tenants)
+            total_users = Subscription.objects.values('tenant_id').distinct().count()
+
+            # Active users (tenants with active subscriptions)
+            active_users = active_subscriptions.values('tenant_id').distinct().count()
+
+            # 10. TRIAL METRICS - Enhanced
+            currently_active_trials = Subscription.objects.filter(
+                status='trial',
+                trial_end_date__gte=now
+            ).count()
+
+            trials_started_period = Subscription.objects.filter(
+                status='trial',
+                start_date__range=(start_date, end_date)
+            ).count()
+
+            # Trial conversion (active subscriptions that started as trials within conversion window)
+            conversion_window_days = 30
+            trials_converted = Subscription.objects.filter(
+                status='active',
+                start_date__range=(start_date - timedelta(days=conversion_window_days), end_date)
+            ).filter(
+                Exists(TenantBillingPreferences.objects.filter(tenant_id=OuterRef('tenant_id')))
+            ).count()
+
+            trial_conversion_rate = (trials_converted / trials_started_period * 100) if trials_started_period else 0
+
+            # Trial usage statistics
+            from apps.billing.models import TrialUsage
+            total_trial_signups = TrialUsage.objects.count()
+            unique_trial_users = TrialUsage.objects.values('tenant_id').distinct().count()
+
+            # ============================================================================
+            # PLAN PERFORMANCE
+            # ============================================================================
+
+            # 11. PLAN PERFORMANCE METRICS
+            plan_performance = Plan.objects.filter(
                 is_active=True,
                 discontinued=False
             ).annotate(
-                subscription_count=Count('subscription', filter=Q(subscription__status='active'))
-            ).values('name', 'price', 'subscription_count')
-
-            # Average Revenue Per User (ARPU)
-            active_customer_count = active_subscriptions.values('tenant_id').distinct().count()
-            arpu = mrr / active_customer_count if active_customer_count else 0
-
-            # Customers by Industry
-            customers_by_industry = Subscription.objects.filter(
-                status='active'
+                total_subscriptions=Count('subscription'),
+                active_subscriptions=Count('subscription', filter=Q(subscription__status='active', subscription__end_date__gte=now)),
+                trial_subscriptions=Count('subscription', filter=Q(subscription__status='trial')),
+                canceled_subscriptions=Count('subscription', filter=Q(subscription__status='canceled')),
+                total_revenue=Sum('subscription__payments__amount', filter=Q(subscription__payments__status='completed')),
+                churn_rate=Count('subscription', filter=Q(subscription__status='canceled')) * 100.0 / Count('subscription'),
+                conversion_rate=Count('subscription', filter=Q(subscription__status='active')) * 100.0 / Count('subscription')
             ).values(
-                'plan__industry'
-            ).annotate(
-                customer_count=Count('tenant_id', distinct=True)
-            ).order_by('-customer_count')
+                'name', 'price', 'billing_period', 'tier_level', 'industry',
+                'total_subscriptions', 'active_subscriptions', 'trial_subscriptions',
+                'canceled_subscriptions', 'total_revenue', 'churn_rate', 'conversion_rate'
+            ).order_by('-active_subscriptions')
 
-            # Renewal Success Rate (auto-renewal success / total due)
+            # ============================================================================
+            # FINANCIAL PROJECTIONS
+            # ============================================================================
+
+            # 12. FINANCIAL PROJECTIONS
+            # Projected MRR for next 3 months (assuming current growth rate)
+            current_mrr = mrr
+
+            # Calculate growth rate from last 3 months
+            three_months_ago = now - timezone.timedelta(days=90)
+            past_mrr_values = []
+
+            for i in range(3):
+                period_start = three_months_ago - timezone.timedelta(days=30*i)
+                period_end = period_start + timezone.timedelta(days=30)
+
+                period_mrr = 0
+                period_active_subs = Subscription.objects.filter(
+                    status='active',
+                    start_date__lte=period_end,
+                    end_date__gte=period_end
+                ).select_related('plan')
+
+                for sub in period_active_subs:
+                    if sub.plan:
+                        price = float(sub.plan.price)
+                        period = sub.plan.billing_period
+                        if period == 'monthly':
+                            period_mrr += price
+                        elif period == 'quarterly':
+                            period_mrr += price / 3
+                        elif period == 'biannual':
+                            period_mrr += price / 6
+                        elif period == 'annual':
+                            period_mrr += price / 12
+
+                past_mrr_values.append(period_mrr)
+
+            # Simple linear growth projection
+            if len(past_mrr_values) >= 2:
+                growth_rate = (past_mrr_values[-1] - past_mrr_values[0]) / len(past_mrr_values)
+            else:
+                growth_rate = 0
+
+            projected_mrr_3months = current_mrr + (growth_rate * 3)
+
+            # ============================================================================
+            # AUTO-RENEWAL METRICS
+            # ============================================================================
+
             from apps.billing.models import TenantBillingPreferences
-            due_auto_renewals = TenantBillingPreferences.objects.filter(
+            auto_renew_enabled = TenantBillingPreferences.objects.filter(
                 auto_renew_enabled=True,
-                renewal_status__in=['active', 'paused']
+                renewal_status='active'
             ).count()
-            # This is a simplified calculation; a more accurate one would track historical renewals
-            renewal_success_rate = 95.0  # Placeholder, would need to be calculated from actual data
 
-            # Payment Methods Breakdown
-            payment_methods = Payment.objects.filter(
-                payment_date__range=(start_date, end_date),
-                status='completed'
-            ).values('provider').annotate(
-                count=Count('id'),
-                total_amount=Sum('amount')
-            ).order_by('-count')
+            auto_renew_disabled = TenantBillingPreferences.objects.filter(
+                auto_renew_enabled=False
+            ).count()
 
-            # Audit Log Summary (last 7 days)
-            audit_log_start = end_date - timedelta(days=7)
-            audit_log_summary = AuditLog.objects.filter(
-                timestamp__gte=audit_log_start
-            ).values('action').annotate(
-                count=Count('id')
-            ).order_by('-count')
+            renewal_failures = TenantBillingPreferences.objects.filter(
+                renewal_failure_count__gt=0
+            ).count()
 
-            # Subscription Status Breakdown
-            total_subscriptions = Subscription.objects.count()
-            active_subscriptions_count = active_subscriptions.count()
-            expired_subscriptions = Subscription.objects.filter(status='expired').count()
-            trial_subscriptions = Subscription.objects.filter(status='trial').count()
-
-            # New metrics requested
-            # Total Users (unique tenants)
-            total_users = Subscription.objects.values('tenant_id').distinct().count()
-
-            # Total Revenue Generated (all completed payments)
-            total_revenue_generated = Payment.objects.filter(
-                status='completed'
-            ).aggregate(total=Sum('amount'))['total'] or 0
-
-            # Active Users by Plan (active subscriptions grouped by plan)
-            active_users_by_plan = Subscription.objects.filter(
-                status='active',
-                end_date__gte=timezone.now()
-            ).select_related('plan').values(
-                'plan__name', 'plan__price', 'plan__billing_period', 'plan__industry'
-            ).annotate(
-                user_count=Count('tenant_id', distinct=True)
-            ).order_by('-user_count')
+            # ============================================================================
+            # COMPREHENSIVE ANALYTICS RESPONSE
+            # ============================================================================
 
             analytics_data = {
-                'mrr': float(mrr),
-                'churn_rate': float(churn_rate),
-                'trial_conversion_rate': float(trial_conversion_rate),
-                'failed_payments_rate': float(failed_rate),
-                'arpu': float(arpu),
-                'customers_by_industry': list(customers_by_industry),
-                'renewal_success_rate': float(renewal_success_rate),
-                'revenue_by_plan': list(revenue_by_plan),
-                'active_plans': list(active_plans),
-                'total_subscriptions': total_subscriptions,
-                'active_subscriptions': active_subscriptions_count,
-                'expired_subscriptions': expired_subscriptions,
-                'trial_subscriptions': trial_subscriptions,
-                'total_payments': total_payments,
-                'completed_payments': Payment.objects.filter(status='completed').count(),
-                'failed_payments': failed_payments,
-                'payment_methods': list(payment_methods),
-                'audit_log_summary': list(audit_log_summary),
-                'timestamp': timezone.now().isoformat(),
-                # New metrics
-                'total_users': total_users,
-                'total_revenue_generated': float(total_revenue_generated),
-                'active_users_by_plan': list(active_users_by_plan)
+                'summary': {
+                    'total_revenue': float(total_revenue_all_time),
+                    'period_revenue': float(period_revenue),
+                    'monthly_recurring_revenue': float(mrr),
+                    'average_revenue_per_user': float(arpu),
+                    'customer_lifetime_value': float(clv),
+                    'total_users': total_users,
+                    'active_users': active_users,
+                    'churn_rate': float(churn_rate),
+                    'payment_success_rate': float(payment_success_rate),
+                    'trial_conversion_rate': float(trial_conversion_rate),
+                    'auto_renewal_rate': (auto_renew_enabled / (auto_renew_enabled + auto_renew_disabled) * 100) if (auto_renew_enabled + auto_renew_disabled) else 0
+                },
+
+                'financial_metrics': {
+                    'revenue': {
+                        'total_all_time': float(total_revenue_all_time),
+                        'in_period': float(period_revenue),
+                        'by_status': list(revenue_by_status),
+                        'average_transaction_value': float(period_revenue / completed_payments) if completed_payments else 0
+                    },
+                    'recurring_revenue': {
+                        'mrr': float(mrr),
+                        'breakdown_by_billing_period': mrr_breakdown,
+                        'arpu': float(arpu),
+                        'clv': float(clv),
+                        'projected_mrr_3months': float(projected_mrr_3months)
+                    }
+                },
+
+                'subscription_metrics': {
+                    'status_breakdown': list(subscription_status_breakdown),
+                    'active_by_plan': list(active_by_plan),
+                    'churn_analysis': {
+                        'rate': float(churn_rate),
+                        'cancellations_in_period': canceled_in_period,
+                        'by_plan': list(churn_by_plan)
+                    },
+                    'plan_changes': {
+                        'upgrades': upgrades,
+                        'downgrades': downgrades,
+                        'net_change': upgrades - downgrades
+                    },
+                    'active_subscriptions': active_subscriptions.count(),
+                    'trial_subscriptions': currently_active_trials
+                },
+
+                'payment_metrics': {
+                    'success_rates': {
+                        'overall_success_rate': float(payment_success_rate),
+                        'failure_rate': float(payment_failure_rate),
+                        'pending_rate': (pending_payments / total_payments_period * 100) if total_payments_period else 0
+                    },
+                    'by_provider': list(payment_methods_performance),
+                    'outstanding_receivables': {
+                        'amount': float(outstanding_receivables['total_amount'] or 0),
+                        'count': outstanding_receivables['count'] or 0
+                    },
+                    'total_transactions': total_payments_period,
+                    'completed_transactions': completed_payments,
+                    'failed_transactions': failed_payments
+                },
+
+                'user_engagement': {
+                    'growth_trends': user_growth_trends,
+                    'trial_metrics': {
+                        'currently_active': currently_active_trials,
+                        'started_in_period': trials_started_period,
+                        'converted_in_period': trials_converted,
+                        'conversion_rate': float(trial_conversion_rate),
+                        'total_trial_signups': total_trial_signups,
+                        'unique_trial_users': unique_trial_users
+                    },
+                    'auto_renewal': {
+                        'enabled': auto_renew_enabled,
+                        'disabled': auto_renew_disabled,
+                        'failure_count': renewal_failures
+                    }
+                },
+
+                'plan_performance': list(plan_performance),
+
+                'operational_efficiency': {
+                    'audit_log_summary': list(AuditLog.objects.filter(
+                        timestamp__range=(start_date, end_date)
+                    ).values('action').annotate(count=Count('id')).order_by('-count')),
+                    'system_health': {
+                        'active_subscriptions_ratio': (active_subscriptions.count() / Subscription.objects.count() * 100) if Subscription.objects.count() else 0,
+                        'payment_processing_efficiency': float(payment_success_rate),
+                        'renewal_failure_rate': (renewal_failures / (auto_renew_enabled + auto_renew_disabled) * 100) if (auto_renew_enabled + auto_renew_disabled) else 0
+                    }
+                },
+
+                'period': {
+                    'start_date': start_date.isoformat(),
+                    'end_date': end_date.isoformat(),
+                    'days': (end_date - start_date).days
+                },
+
+                'generated_at': now.isoformat(),
+                'data_freshness': 'real-time'
             }
 
+            # Validate with serializer
             serializer = AnalyticsSerializer(data=analytics_data)
             serializer.is_valid(raise_exception=True)
-
-            now = timezone.now()
-            currently_active_free_trials = Subscription.objects.filter(status='trial', trial_end_date__gte=now).count()
-            from apps.billing.models import TenantBillingPreferences
-            total_auto_renew_on = TenantBillingPreferences.objects.filter(auto_renew_enabled=True, renewal_status='active').count()
-            total_auto_renew_off = TenantBillingPreferences.objects.filter(auto_renew_enabled=False).count()
-            # Placeholder for branches: optional, needs model or per-tenant sum
-            total_business_branches = 0
-            analytics_data['currently_active_free_trials'] = currently_active_free_trials
-            analytics_data['total_auto_renew_on'] = total_auto_renew_on
-            analytics_data['total_auto_renew_off'] = total_auto_renew_off
-            analytics_data['total_business_branches'] = total_business_branches
 
             return Response(serializer.data)
 
         except Exception as e:
-            logger.error(f"Analytics generation failed: {str(e)}")
+            logger.error(f"Enhanced analytics generation failed: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
             return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @swagger_helper(tags=['Superadmin Portal'], model='Subscription')
