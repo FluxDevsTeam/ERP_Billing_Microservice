@@ -3,8 +3,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from django.utils import timezone
-from django.db.models import Sum, Count, F, Q, Case, When, Value
-from django.db.models.functions import Coalesce
+from django.db.models import Q, Exists, OuterRef
 from django.db.models.functions import TruncMonth, TruncDay
 from django.db.models import Exists, OuterRef, DecimalField
 from apps.billing.models import Subscription, AuditLog, Plan, TenantBillingPreferences
@@ -46,23 +45,32 @@ class SuperadminPortalViewSet(viewsets.ViewSet):
 
             # 1. REVENUE METRICS
             # Total Revenue (all completed payments)
-            total_revenue_all_time = Payment.objects.filter(
-                status='completed'
-            ).aggregate(total=Sum('amount'))['total'] or 0
+            completed_payments_all_time = Payment.objects.filter(status='completed')
+            total_revenue_all_time = sum(float(p.amount) for p in completed_payments_all_time)
 
             # Revenue in period
-            period_revenue = Payment.objects.filter(
+            period_completed_payments = Payment.objects.filter(
                 payment_date__range=(start_date, end_date),
                 status='completed'
-            ).aggregate(total=Sum('amount'))['total'] or 0
+            )
+            period_revenue = sum(float(p.amount) for p in period_completed_payments)
 
             # Revenue by payment status
-            revenue_by_status = Payment.objects.filter(
+            revenue_by_status = []
+            for status_value in Payment.objects.filter(
                 payment_date__range=(start_date, end_date)
-            ).values('status').annotate(
-                total_amount=Sum('amount'),
-                count=Count('id')
-            ).order_by('status')
+            ).values('status').distinct():
+                status_payments = Payment.objects.filter(
+                    payment_date__range=(start_date, end_date),
+                    status=status_value['status']
+                )
+                total_amount = sum(float(p.amount) for p in status_payments)
+                count = status_payments.count()
+                revenue_by_status.append({
+                    'status': status_value['status'],
+                    'total_amount': total_amount,
+                    'count': count
+                })
 
             # 2. MONTHLY RECURRING REVENUE (MRR) - Enhanced
             active_subscriptions = Subscription.objects.filter(
@@ -109,17 +117,18 @@ class SuperadminPortalViewSet(viewsets.ViewSet):
 
             # Subscription status breakdown
             total_subscription_count = Subscription.objects.count()
+            subscription_status_breakdown = []
             if total_subscription_count > 0:
-                subscription_status_breakdown = []
-                for item in Subscription.objects.values('status').annotate(count=Count('id')).order_by('-count'):
-                    percentage = (item['count'] * 100) / total_subscription_count if item['count'] > 0 else 0
+                for status_value in Subscription.objects.values('status').distinct():
+                    count = Subscription.objects.filter(status=status_value['status']).count()
+                    percentage = (count * 100) / total_subscription_count if count > 0 else 0
                     subscription_status_breakdown.append({
-                        'status': item['status'],
-                        'count': item['count'],
+                        'status': status_value['status'],
+                        'count': count,
                         'percentage': float(percentage)
                     })
-            else:
-                subscription_status_breakdown = []
+                # Sort by count descending
+                subscription_status_breakdown.sort(key=lambda x: x['count'], reverse=True)
 
             # Active subscriptions by plan
             active_by_plan = []
@@ -170,30 +179,38 @@ class SuperadminPortalViewSet(viewsets.ViewSet):
             churn_rate = (canceled_in_period / initial_active * 100) if initial_active else 0
 
             # Churn by plan
-            churn_by_plan = Subscription.objects.filter(
+            churn_by_plan = []
+            for plan_name in Subscription.objects.filter(
                 status='canceled',
                 canceled_at__range=(start_date, end_date)
-            ).values('plan__name').annotate(
-                churn_count=Count('id')
-            ).order_by('-churn_count')
+            ).values('plan__name').distinct():
+                churn_count = Subscription.objects.filter(
+                    status='canceled',
+                    canceled_at__range=(start_date, end_date),
+                    plan__name=plan_name['plan__name']
+                ).count()
+                churn_by_plan.append({
+                    'plan__name': plan_name['plan__name'],
+                    'churn_count': churn_count
+                })
+            # Sort by churn_count descending
+            churn_by_plan.sort(key=lambda x: x['churn_count'], reverse=True)
 
             # 6. SUBSCRIPTION CHANGES (Upgrades/Downgrades)
             # Analyze audit logs for plan changes
-            plan_changes = AuditLog.objects.filter(
+            plan_change_logs = AuditLog.objects.filter(
                 action='plan_changed',
                 timestamp__range=(start_date, end_date)
-            ).values('details').annotate(
-                count=Count('id')
             )
 
             upgrades = 0
             downgrades = 0
-            for change in plan_changes:
-                details = change.get('details', {})
+            for change in plan_change_logs:
+                details = change.details or {}
                 if details.get('is_upgrade'):
-                    upgrades += change['count']
+                    upgrades += 1
                 elif details.get('is_downgrade'):
-                    downgrades += change['count']
+                    downgrades += 1
 
             # ============================================================================
             # PAYMENT METRICS
@@ -224,23 +241,30 @@ class SuperadminPortalViewSet(viewsets.ViewSet):
 
             # Payment methods performance
             payment_methods_performance = []
-            for item in Payment.objects.filter(
+            for provider_name in Payment.objects.filter(
                 payment_date__range=(start_date, end_date)
-            ).values('provider').annotate(
-                total_count=Count('id'),
-                success_count=Count('id', filter=Q(status='completed')),
-                failed_count=Count('id', filter=Q(status='failed')),
-                total_amount=Coalesce(Sum('amount', filter=Q(status='completed')), 0)
-            ).order_by('-total_count'):
-                success_rate = (item['success_count'] * 100) / item['total_count'] if item['total_count'] > 0 else 0
+            ).values('provider').distinct():
+                provider_payments = Payment.objects.filter(
+                    payment_date__range=(start_date, end_date),
+                    provider=provider_name['provider']
+                )
+                total_count = provider_payments.count()
+                success_count = provider_payments.filter(status='completed').count()
+                failed_count = provider_payments.filter(status='failed').count()
+                total_amount = sum(float(p.amount) for p in provider_payments.filter(status='completed'))
+                success_rate = (success_count * 100) / total_count if total_count > 0 else 0
+
                 payment_methods_performance.append({
-                    'provider': item['provider'],
-                    'total_count': item['total_count'],
-                    'success_count': item['success_count'],
-                    'failed_count': item['failed_count'],
-                    'total_amount': float(item['total_amount'] or 0),
+                    'provider': provider_name['provider'],
+                    'total_count': total_count,
+                    'success_count': success_count,
+                    'failed_count': failed_count,
+                    'total_amount': float(total_amount),
                     'success_rate': float(success_rate)
                 })
+
+            # Sort by total_count descending
+            payment_methods_performance.sort(key=lambda x: x['total_count'], reverse=True)
 
             # 8. OUTSTANDING RECEIVABLES
             # Pending payments that are overdue (payment_date > 7 days ago)
@@ -318,9 +342,13 @@ class SuperadminPortalViewSet(viewsets.ViewSet):
                 active_subs = plan.subscription_set.filter(status='active', end_date__gte=now).count()
                 trial_subs = plan.subscription_set.filter(status='trial').count()
                 canceled_subs = plan.subscription_set.filter(status='canceled').count()
-                total_revenue = plan.subscription_set.filter(
-                    payments__status='completed'
-                ).aggregate(total=Sum('payments__amount'))['total'] or 0
+                # Get all completed payments for subscriptions of this plan
+                total_revenue = sum(
+                    float(payment.amount) for payment in Payment.objects.filter(
+                        subscription__plan=plan,
+                        status='completed'
+                    )
+                )
 
                 churn_rate = (canceled_subs * 100.0 / total_subs) if total_subs > 0 else 0
                 conversion_rate = (active_subs * 100.0 / total_subs) if total_subs > 0 else 0
@@ -494,9 +522,18 @@ class SuperadminPortalViewSet(viewsets.ViewSet):
                 'plan_performance': list(plan_performance),
 
                 'operational_efficiency': {
-                    'audit_log_summary': list(AuditLog.objects.filter(
-                        timestamp__range=(start_date, end_date)
-                    ).values('action').annotate(count=Count('id')).order_by('-count')),
+                    'audit_log_summary': [
+                        {
+                            'action': action_name['action'],
+                            'count': AuditLog.objects.filter(
+                                timestamp__range=(start_date, end_date),
+                                action=action_name['action']
+                            ).count()
+                        }
+                        for action_name in AuditLog.objects.filter(
+                            timestamp__range=(start_date, end_date)
+                        ).values('action').distinct()
+                    ],
                     'system_health': {
                         'active_subscriptions_ratio': (active_subscriptions.count() / Subscription.objects.count() * 100) if Subscription.objects.count() else 0,
                         'payment_processing_efficiency': float(payment_success_rate),
@@ -674,7 +711,7 @@ class SuperadminPortalViewSet(viewsets.ViewSet):
             'total': qs.count(),
             'completed': qs.filter(status='completed').count(),
             'failed': qs.filter(status='failed').count(),
-            'total_revenue': qs.filter(status='completed').aggregate(total=Sum('amount'))['total'] or 0,
+            'total_revenue': sum(float(p.amount) for p in qs.filter(status='completed')),
         }
         from apps.payment.serializers import PaymentSerializer
         results = PaymentSerializer(qs.order_by('-payment_date')[:100], many=True).data
