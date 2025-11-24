@@ -4,6 +4,7 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from django.utils import timezone
 from django.db.models import Sum, Count, F, Q, Case, When, Value
+from django.db.models.functions import Coalesce
 from django.db.models.functions import TruncMonth, TruncDay
 from django.db.models import Exists, OuterRef, DecimalField
 from apps.billing.models import Subscription, AuditLog, Plan, TenantBillingPreferences
@@ -209,7 +210,7 @@ class SuperadminPortalViewSet(viewsets.ViewSet):
                 total_count=Count('id'),
                 success_count=Count('id', filter=Q(status='completed')),
                 failed_count=Count('id', filter=Q(status='failed')),
-                total_amount=Sum('amount', filter=Q(status='completed')),
+                total_amount=Coalesce(Sum('amount', filter=Q(status='completed')), 0),
                 success_rate=Case(
                     When(total_count__gt=0,
                          then=Count('id', filter=Q(status='completed')) * 100.0 / F('total_count')),
