@@ -63,9 +63,9 @@ class SubscriptionView(viewsets.ModelViewSet):
     def get_permissions(self):
         if self.action in ['list', 'retrieve']:
             return [IsAuthenticated(), IsCEOorSuperuser()]
-        if self.action in ['create', 'update', 'partial_update', 'suspend_subscription', 'activate_trial']:
+        if self.action in ['activate_trial']:
             return [IsAuthenticated(), CanViewEditSubscription()]
-        if self.action == 'destroy':
+        if self.action == ['destroy', 'create', 'update', 'partial_update', 'suspend_subscription']:
             return [IsAuthenticated(), IsSuperuser()]
         return [IsAuthenticated()]
 
