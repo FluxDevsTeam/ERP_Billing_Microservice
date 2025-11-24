@@ -112,7 +112,7 @@ class SuperadminPortalViewSet(viewsets.ViewSet):
             subscription_status_breakdown = Subscription.objects.values('status').annotate(
                 count=Count('id'),
                 percentage=Case(
-                    When(count__gt=0, then=F('count') * 100.0 / total_subscription_count),
+                    When(count__gt=0, then=F('count') * 100 / total_subscription_count),
                     default=0,
                     output_field=DecimalField()
                 ) if total_subscription_count > 0 else Value(0, output_field=DecimalField())
@@ -213,7 +213,7 @@ class SuperadminPortalViewSet(viewsets.ViewSet):
                 total_amount=Coalesce(Sum('amount', filter=Q(status='completed')), 0),
                 success_rate=Case(
                     When(total_count__gt=0,
-                         then=Count('id', filter=Q(status='completed')) * 100.0 / F('total_count')),
+                         then=Count('id', filter=Q(status='completed')) * 100 / F('total_count')),
                     default=0,
                     output_field=DecimalField()
                 )
