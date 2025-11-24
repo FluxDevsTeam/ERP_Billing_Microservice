@@ -3,10 +3,10 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from django.utils import timezone
-from django.db.models import Sum, Count, F, Q, Case, When
+from django.db.models import Sum, Count, F, Q, Case, When, Value
 from django.db.models.functions import TruncMonth, TruncDay
 from django.db.models import Exists, OuterRef, DecimalField
-from apps.billing.models import Subscription, AuditLog, Plan
+from apps.billing.models import Subscription, AuditLog, Plan, TenantBillingPreferences
 from apps.payment.models import Payment, WebhookEvent
 from apps.payment.services import PaymentService
 from apps.billing.serializers import SubscriptionSerializer, AuditLogSerializer, PlanSerializer
@@ -107,9 +107,14 @@ class SuperadminPortalViewSet(viewsets.ViewSet):
             # ============================================================================
 
             # Subscription status breakdown
+            total_subscription_count = Subscription.objects.count()
             subscription_status_breakdown = Subscription.objects.values('status').annotate(
                 count=Count('id'),
-                percentage=Count('id') * 100.0 / Subscription.objects.count()
+                percentage=Case(
+                    When(count__gt=0, then=F('count') * 100.0 / total_subscription_count),
+                    default=0,
+                    output_field=DecimalField()
+                ) if total_subscription_count > 0 else Value(0, output_field=DecimalField())
             ).order_by('-count')
 
             # Active subscriptions by plan
@@ -205,7 +210,12 @@ class SuperadminPortalViewSet(viewsets.ViewSet):
                 success_count=Count('id', filter=Q(status='completed')),
                 failed_count=Count('id', filter=Q(status='failed')),
                 total_amount=Sum('amount', filter=Q(status='completed')),
-                success_rate=Count('id', filter=Q(status='completed')) * 100.0 / Count('id')
+                success_rate=Case(
+                    When(total_count__gt=0,
+                         then=Count('id', filter=Q(status='completed')) * 100.0 / F('total_count')),
+                    default=0,
+                    output_field=DecimalField()
+                )
             ).order_by('-total_count')
 
             # 8. OUTSTANDING RECEIVABLES
@@ -277,22 +287,36 @@ class SuperadminPortalViewSet(viewsets.ViewSet):
             # ============================================================================
 
             # 11. PLAN PERFORMANCE METRICS
-            plan_performance = Plan.objects.filter(
-                is_active=True,
-                discontinued=False
-            ).annotate(
-                total_subscriptions=Count('subscription'),
-                active_subscriptions=Count('subscription', filter=Q(subscription__status='active', subscription__end_date__gte=now)),
-                trial_subscriptions=Count('subscription', filter=Q(subscription__status='trial')),
-                canceled_subscriptions=Count('subscription', filter=Q(subscription__status='canceled')),
-                total_revenue=Sum('subscription__payments__amount', filter=Q(subscription__payments__status='completed')),
-                churn_rate=Count('subscription', filter=Q(subscription__status='canceled')) * 100.0 / Count('subscription'),
-                conversion_rate=Count('subscription', filter=Q(subscription__status='active')) * 100.0 / Count('subscription')
-            ).values(
-                'name', 'price', 'billing_period', 'tier_level', 'industry',
-                'total_subscriptions', 'active_subscriptions', 'trial_subscriptions',
-                'canceled_subscriptions', 'total_revenue', 'churn_rate', 'conversion_rate'
-            ).order_by('-active_subscriptions')
+            plan_performance = []
+            for plan in Plan.objects.filter(is_active=True, discontinued=False):
+                total_subs = plan.subscription_set.count()
+                active_subs = plan.subscription_set.filter(status='active', end_date__gte=now).count()
+                trial_subs = plan.subscription_set.filter(status='trial').count()
+                canceled_subs = plan.subscription_set.filter(status='canceled').count()
+                total_revenue = plan.subscription_set.filter(
+                    payments__status='completed'
+                ).aggregate(total=Sum('payments__amount'))['total'] or 0
+
+                churn_rate = (canceled_subs * 100.0 / total_subs) if total_subs > 0 else 0
+                conversion_rate = (active_subs * 100.0 / total_subs) if total_subs > 0 else 0
+
+                plan_performance.append({
+                    'name': plan.name,
+                    'price': float(plan.price),
+                    'billing_period': plan.billing_period,
+                    'tier_level': plan.tier_level,
+                    'industry': plan.industry,
+                    'total_subscriptions': total_subs,
+                    'active_subscriptions': active_subs,
+                    'trial_subscriptions': trial_subs,
+                    'canceled_subscriptions': canceled_subs,
+                    'total_revenue': float(total_revenue),
+                    'churn_rate': float(churn_rate),
+                    'conversion_rate': float(conversion_rate)
+                })
+
+            # Sort by active subscriptions descending
+            plan_performance.sort(key=lambda x: x['active_subscriptions'], reverse=True)
 
             # ============================================================================
             # FINANCIAL PROJECTIONS
@@ -344,7 +368,6 @@ class SuperadminPortalViewSet(viewsets.ViewSet):
             # AUTO-RENEWAL METRICS
             # ============================================================================
 
-            from apps.billing.models import TenantBillingPreferences
             auto_renew_enabled = TenantBillingPreferences.objects.filter(
                 auto_renew_enabled=True,
                 renewal_status='active'
