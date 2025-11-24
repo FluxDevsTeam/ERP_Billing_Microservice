@@ -245,13 +245,14 @@ class SuperadminPortalViewSet(viewsets.ViewSet):
             # 8. OUTSTANDING RECEIVABLES
             # Pending payments that are overdue (payment_date > 7 days ago)
             overdue_threshold = now - timezone.timedelta(days=7)
-            outstanding_receivables = Payment.objects.filter(
+            outstanding_payments = Payment.objects.filter(
                 status='pending',
                 payment_date__lt=overdue_threshold
-            ).aggregate(
-                total_amount=Sum('amount'),
-                count=Count('id')
             )
+            outstanding_receivables = {
+                'total_amount': sum(float(p.amount) for p in outstanding_payments),
+                'count': outstanding_payments.count()
+            }
 
             # ============================================================================
             # USER GROWTH AND ENGAGEMENT
