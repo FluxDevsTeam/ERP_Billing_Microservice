@@ -172,10 +172,7 @@ class SubscriptionService:
             status='trial' if is_trial else 'active',
             start_date=start_date,
             trial_end_date=trial_end_date,
-            end_date=None,  # Let save() calculate it first
-            next_payment_date=trial_end_date if is_trial else None,
-            is_first_time_subscription=not previous_subscription,
-            trial_used=is_trial
+            end_date=None  # Let save() calculate it first
         )
         subscription.save()  # This will calculate end_date based on billing_period
         

@@ -300,7 +300,7 @@ class PaymentVerifyViewSet(viewsets.ViewSet):
             if existing_payment and existing_payment.status == 'completed':
                 # If extension payment, redirect to subscription
                 if existing_payment.payment_type == 'extension' and existing_payment.subscription:
-                    return redirect(f"{settings.FRONTEND_PATH}/subscription/{existing_payment.subscription.id}/?status=extended")
+                    return redirect(f"{settings.FRONTEND_PATH}/settings/subscription{existing_payment.subscription.id}/?status=extended")
                 return redirect(f"{settings.FRONTEND_PATH}/plan/{plan.id}")
 
             provider_config = settings.PAYMENT_PROVIDERS[provider]
