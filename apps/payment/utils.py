@@ -6,15 +6,19 @@ import jwt
 from django.conf import settings
 
 
-def generate_confirm_token(user, subscription_id):
-    try:
-        refresh = RefreshToken.for_user(user)
-        refresh['subscription_id'] = subscription_id
-        refresh['exp'] = int((now() + timedelta(hours=1)).timestamp())
-        return str(refresh.access_token)
-    except Exception as e:
-        raise
+def generate_confirm_token(user, plan_id):
+    refresh = RefreshToken.for_user(user)
+    
+    refresh["user"] = {
+        "id": user.id,
+        "email": user.email,
+        "first_name": user.first_name or "",
+        "last_name": user.last_name or "",
+    }
+    refresh["plan_id"] = plan_id
+    refresh['exp'] = int((now() + timedelta(hours=1)).timestamp())
 
+    return str(refresh.access_token)
 
 def initiate_refund(provider, amount, user, transaction_id):
     try:

@@ -5,7 +5,7 @@ from rest_framework.response import Response
 from django.conf import settings
 
 
-def initiate_flutterwave_payment(confirm_token, amount, user, plan_id, tenant_id, tenant_name=None, metadata=None):
+def initiate_flutterwave_payment(confirm_token, amount, user, plan_id, tenant_id, auto_renew, tenant_name=None):
     try:
         flutterwave_key = settings.PAYMENT_PROVIDERS["flutterwave"]["secret_key"]
         url = "https://api.flutterwave.com/v3/payments"
@@ -15,13 +15,14 @@ def initiate_flutterwave_payment(confirm_token, amount, user, plan_id, tenant_id
         phone_no = user.phone_number or ""
         reference = str(uuid.uuid4())
         base_url = settings.BILLING_MICROSERVICE_URL
-        redirect_url = f"{base_url}/api/v1/payment/payment-verify/confirm/?tx_ref={reference}&confirm_token={confirm_token}&provider=flutterwave&amount={amount}&plan_id={plan_id}&tenant_id={tenant_id}"
+        redirect_url = f"{base_url}/api/v1/payment/payment-verify/confirm/?tx_ref={reference}&confirm_token={confirm_token}&auto_renew={auto_renew}&provider=flutterwave&amount={amount}&plan_id={plan_id}&tenant_id={tenant_id}"
+
         data = {
             "tx_ref": reference,
             "amount": str(amount),
             "currency": settings.PAYMENT_CURRENCY,
             "redirect_url": redirect_url,
-            "meta": {**{"consumer_id": user.id, "plan_id": plan_id, "tenant_id": tenant_id}, **(metadata or {})},
+            "meta": {"consumer_id": user.id, "plan_id": plan_id, "tenant_id": tenant_id, "auto_renew": auto_renew},
             "customer": {
                 "email": user.email,
                 "phonenumber": phone_no,
@@ -57,7 +58,7 @@ def initiate_flutterwave_payment(confirm_token, amount, user, plan_id, tenant_id
         return Response({"error": "Payment processing failed. Please try again."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
-def initiate_paystack_payment(confirm_token, amount, user, plan_id, tenant_id, tenant_name=None, metadata=None):
+def initiate_paystack_payment(confirm_token, amount, user, plan_id, tenant_id, auto_renew, tenant_name=None,):
     try:
         paystack_key = settings.PAYMENT_PROVIDERS['paystack']['secret_key']
         headers = {"Authorization": f"Bearer {paystack_key}", "Content-Type": "application/json"}
@@ -67,15 +68,16 @@ def initiate_paystack_payment(confirm_token, amount, user, plan_id, tenant_id, t
         phone_no = user.phone_number or ""
         reference = str(uuid.uuid4())
         base_url = settings.BILLING_MICROSERVICE_URL
-        callback_url = f"{base_url}/api/v1/payment/payment-verify/confirm/?tx_ref={reference}&confirm_token={confirm_token}&provider=paystack&amount={amount}&plan_id={plan_id}&tenant_id={tenant_id}"
+        callback_url = f"{base_url}/api/v1/payment/payment-verify/confirm/?tx_ref={reference}&confirm_token={confirm_token}&auto_renew={auto_renew}&provider=paystack&amount={amount}&plan_id={plan_id}&tenant_id={tenant_id}"
         data = {
             "amount": int(amount * 100),
             "email": user.email,
             "currency": settings.PAYMENT_CURRENCY,
             "reference": reference,
             "callback_url": callback_url,
-            "metadata": {**{"consumer_id": user.id, "plan_id": plan_id, "tenant_id": tenant_id}, **(metadata or {})}
+            "metadata": {"consumer_id": user.id, "plan_id": plan_id, "tenant_id": tenant_id, "auto_renew": auto_renew}
         }
+        print(callback_url)
         response = requests.post(url, headers=headers, json=data)
         response.raise_for_status()
         response_data = response.json()

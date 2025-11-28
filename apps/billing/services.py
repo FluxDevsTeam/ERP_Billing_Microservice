@@ -230,6 +230,88 @@ class SubscriptionService:
         }
 
     @transaction.atomic
+    def create_first_subscription(self, tenant_id, plan_id, user, auto_renew):
+        try:
+            tenant_uuid = uuid.UUID(tenant_id)
+        except ValueError:
+            logger.error(f"Subscription creation failed: Invalid tenant_id {tenant_id}")
+            raise ValidationError("Invalid tenant_id format")
+
+        if not plan_id:
+            raise ValidationError("plan_id is required for paid subscriptions")
+        try:
+            plan_uuid = uuid.UUID(plan_id)
+            plan = Plan.objects.get(id=plan_uuid)
+            if not plan.is_active or plan.discontinued:
+                logger.warning(f"Subscription creation failed: Plan {plan_id} is not available")
+                raise ValidationError("Plan is not available")
+        except ValueError:
+            logger.error(f"Subscription creation failed: Invalid plan_id {plan_id}")
+            raise ValidationError("Invalid plan_id format")
+
+        existing_active_sub = Subscription.objects.filter(
+            tenant_id=tenant_uuid,
+            status__in=['active', 'trial', 'pending']
+        ).first()
+        if existing_active_sub:
+            logger.warning(f"Subscription creation blocked: Tenant {tenant_id} already has active subscription {existing_active_sub.id}")
+            raise ValidationError("Active subscription already exists")
+
+        user_email = user["email"]
+
+        # Calculate start date
+        now = timezone.now()
+        start_date = now
+
+        # Create new subscription
+        subscription = Subscription(
+            tenant_id=tenant_uuid,
+            plan=plan,
+            status='active',
+            start_date=start_date,
+            end_date=None
+        )
+        subscription.save()
+    
+        # Create or update TenantBillingPreferences with auto_renew setting
+        preferences, created = TenantBillingPreferences.objects.get_or_create(
+            tenant_id=tenant_uuid,
+            defaults={
+                'user_id': str(user) if user else None,
+                'auto_renew_enabled': auto_renew,
+                'renewal_status': 'active' if auto_renew else 'paused',
+                'preferred_plan': plan,
+                'subscription_expiry_date': subscription.end_date,
+                'next_renewal_date': subscription.end_date if auto_renew else None,
+            }
+        )
+        if not created:
+            preferences.auto_renew_enabled = auto_renew
+            preferences.renewal_status = 'active' if auto_renew else 'paused'
+            preferences.preferred_plan = plan
+            preferences.subscription_expiry_date = subscription.end_date
+            preferences.next_renewal_date = subscription.end_date if auto_renew else None
+            preferences.save()
+    
+        self._audit_log(subscription, 'created', user, {
+            'plan_name': plan.name,
+            'tenant_id': str(tenant_id),
+            'billing_period': plan.billing_period,
+            'is_trial': False,
+            'user_email': user_email,
+            'machine_number': None,
+            'auto_renew_enabled': auto_renew,
+        })
+
+        return subscription, {
+            'status': 'success',
+            'subscription_id': str(subscription.id),
+            'is_trial': False,
+            'carried_days': 0,
+            'previous_subscription_id': None
+        }
+
+    @transaction.atomic
     def renew_subscription(self, subscription_id: str, user: str = None) -> Tuple[Subscription, Dict[str, Any]]:
         try:
             subscription = Subscription.objects.get(id=subscription_id)
