@@ -52,6 +52,7 @@ class AuditLog(models.Model):
 class Plan(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     INDUSTRY_CHOICES = (
+        ("Basic", "Basic"),
         ("Finance", "Finance"),
         ("Healthcare", "Healthcare"),
         ("Production", "Production"),
